@@ -1,0 +1,277 @@
+---
+title: "spatial_analysis"
+format: html
+---
+
+### Spatial Analysis
+```{r}
+library(ggplot2)
+library(sf)
+
+master_sf <- master_sf %>%
+  mutate(
+    rural_cat = case_when(
+      RUCC_2013 <= 3 ~ "Urban (1-3)",
+      RUCC_2013 <= 6 ~ "Semi-Rural (4-6)",
+      RUCC_2013 >= 7 ~ "Rural (7-9)"
+    ),
+    rural_cat = factor(rural_cat, 
+                       levels = c("Urban (1-3)", 
+                                  "Semi-Rural (4-6)", 
+                                  "Rural (7-9)"))
+  )
+
+ggplot(master_sf) +
+  geom_sf(aes(fill = overdose_rate), color = NA) +
+  scale_fill_viridis_c(
+    name     = "Drug Overdose\nRate",
+    na.value = "grey80",
+    option   = "magma",
+    direction = -1
+  ) +
+  facet_wrap(~rural_cat, ncol = 1) +
+  labs(
+    title    = "Drug Overdose Rates by Rural-Urban Classification",
+    subtitle = "County-level rates, 2019",
+    caption  = "Sources: CDC, USDA RUCC 2013"
+  ) +
+  theme_void() +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    legend.position = "right",
+    strip.text    = element_text(face = "bold", size = 11)
+  )
+```
+
+```{r}
+master_sf %>%
+  filter(RUCC_2013 >= 7) %>%
+  mutate(prison_present = factor(prison_present,
+                                 levels = c(0, 1),
+                                 labels = c("No Prison", "Prison Present"))) %>%
+  ggplot() +
+  geom_sf(aes(fill = overdose_rate), color = NA) +
+  scale_fill_viridis_c(
+    name      = "Drug Overdose\nRate",
+    na.value  = "grey80",
+    option    = "magma",
+    direction = -1
+  ) +
+  facet_wrap(~prison_present, ncol = 1) +
+  labs(
+    title    = "Drug Overdose Rates by Prison Presence in Rural Counties",
+    subtitle = "RUCC 7-9 counties, 2019",
+    caption  = "Sources: CDC, USDA RUCC 2013, ICPSR"
+  ) +
+  theme_void() +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    legend.position = "right",
+    strip.text    = element_text(face = "bold", size = 11)
+  )
+```
+
+```{r}
+outcomes_full <- c(
+  "overdose_rate"     = "Drug Overdose Rate",
+  "suicide_rate"      = "Suicide Rate",
+  "divorce_rate"      = "Divorce Rate",
+  "life_exp_weighted" = "Life Expectancy (weighted)",
+  "medhhinc"          = "Median Household Income",
+  "unemp_rate"        = "Unemployment Rate",
+  "pct_poverty"       = "Poverty Rate",
+  "pct_white"         = "% White",
+  "pct_black"         = "% Black",
+  "pct_hispanic"      = "% Hispanic",
+  "homeown_rate"      = "Homeownership Rate",
+  "log_pop"           = "Log Population"
+)
+
+rural_only <- master_clean %>%
+  st_drop_geometry() %>%
+  filter(RUCC_2013 >= 7)
+
+map_dfr(names(outcomes_full), function(var) {
+  t <- t.test(rural_only[[var]] ~ rural_only$prison_present,
+              na.action = na.omit)
+  tibble(
+    variable       = outcomes_full[[var]],
+    mean_no_prison = t$estimate[1],
+    mean_prison    = t$estimate[2],
+    difference     = t$estimate[2] - t$estimate[1],
+    p_value        = t$p.value
+  )
+}) %>%
+  gt() %>%
+  cols_label(
+    variable       = "Variable",
+    mean_no_prison = "No Prison",
+    mean_prison    = "Prison County",
+    difference     = "Difference",
+    p_value        = "p-value"
+  ) %>%
+  fmt_number(
+    columns  = c(mean_no_prison, mean_prison, difference),
+    decimals = 3
+  ) %>%
+  fmt_number(columns = p_value, decimals = 4) %>%
+  tab_header(
+    title    = "Rural Counties: Comparison by Prison Presence",
+    subtitle = "Two-sample t-tests, RUCC 7-9 counties, 2019"
+  ) %>%
+  tab_spanner(
+    label   = "Group Means",
+    columns = c(mean_no_prison, mean_prison)
+  ) %>%
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = "#fff3cd"),
+    locations = cells_body(
+      rows = p_value < 0.05
+    )
+  )
+```
+
+
+```{r}
+master_clean %>%
+  st_drop_geometry() %>%
+  filter(RUCC_2013 >= 7) %>%
+  mutate(
+    prison_cat = case_when(
+      prison_present == 0                                        ~ "No Prison",
+      prison_present == 1 & is.na(capacity_total)               ~ "Prison: No Capacity Data",
+      prison_present == 1 & capacity_total <= median(capacity_total, 
+                            na.rm = TRUE)                        ~ "Prison: Small Capacity",
+      prison_present == 1 & capacity_total > median(capacity_total, 
+                            na.rm = TRUE)                        ~ "Prison: Large Capacity"
+    ),
+    prison_cat = factor(prison_cat, levels = c(
+      "No Prison",
+      "Prison: Small Capacity",
+      "Prison: Large Capacity",
+      "Prison: No Capacity Data"
+    ))
+  ) %>%
+  group_by(prison_cat) %>%
+  summarise(
+    n             = n(),
+    overdose_mean = mean(overdose_rate, na.rm = TRUE),
+    suicide_mean  = mean(suicide_rate,  na.rm = TRUE),
+    divorce_mean  = mean(divorce_rate,  na.rm = TRUE),
+    life_exp_mean = mean(life_exp_weighted, na.rm = TRUE)
+  ) %>%
+  gt() %>%
+  cols_label(
+    prison_cat    = "County Type",
+    n             = "N",
+    overdose_mean = "Overdose Rate",
+    suicide_mean  = "Suicide Rate",
+    divorce_mean  = "Divorce Rate",
+    life_exp_mean = "Life Expectancy"
+  ) %>%
+  fmt_number(
+    columns  = c(overdose_mean, suicide_mean, 
+                 life_exp_mean),
+    decimals = 2
+  ) %>%
+  fmt_number(
+    columns  = divorce_mean,
+    decimals = 3
+  ) %>%
+  tab_header(
+    title    = "Robustness Check: Overdose Rates by Prison Capacity",
+    subtitle = "Rural counties (RUCC 7-9), 2019"
+  ) %>%
+  tab_spanner(
+    label   = "Mean Outcome by Group",
+    columns = c(overdose_mean, suicide_mean, 
+                divorce_mean, life_exp_mean)
+  ) %>%
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) %>%
+  tab_footnote(
+    footnote = "If elevated overdose rates were driven purely by in-prison 
+    mortality, rates should scale with facility size. The inverse pattern 
+    observed here is inconsistent with a pure compositional artifact.",
+    locations = cells_column_labels(columns = overdose_mean)
+  )
+```
+
+```{r}
+library(dplyr)
+library(gt)
+library(sf)
+
+master_clean %>%
+  st_drop_geometry() %>%
+  filter(RUCC_2013 >= 7) %>%
+  mutate(
+    prison_cat = case_when(
+      prison_present == 0                                        ~ "No Prison",
+      prison_present == 1 & is.na(capacity_total)               ~ "Prison: No Capacity Data",
+      prison_present == 1 & capacity_total <= median(capacity_total,
+                            na.rm = TRUE)                        ~ "Prison: Small Capacity",
+      prison_present == 1 & capacity_total > median(capacity_total,
+                            na.rm = TRUE)                        ~ "Prison: Large Capacity"
+    ),
+    prison_cat = factor(prison_cat, levels = c(
+      "No Prison",
+      "Prison: Small Capacity",
+      "Prison: Large Capacity",
+      "Prison: No Capacity Data"
+    ))
+  ) %>%
+  group_by(prison_cat) %>%
+  summarise(
+    n             = n(),
+    overdose_mean = mean(overdose_rate, na.rm = TRUE),
+    suicide_mean  = mean(suicide_rate,  na.rm = TRUE),
+    divorce_mean  = mean(divorce_rate,  na.rm = TRUE),
+    life_exp_mean = mean(life_exp_weighted, na.rm = TRUE)
+  ) %>%
+  gt() %>%
+  cols_label(
+    prison_cat    = "County Type",
+    n             = "N",
+    overdose_mean = "Overdose Rate",
+    suicide_mean  = "Suicide Rate",
+    divorce_mean  = "Divorce Rate",
+    life_exp_mean = "Life Expectancy"
+  ) %>%
+  fmt_number(
+    columns  = c(overdose_mean, suicide_mean, life_exp_mean),
+    decimals = 2
+  ) %>%
+  fmt_number(
+    columns  = divorce_mean,
+    decimals = 3
+  ) %>%
+  tab_header(
+    title    = "Rates by Prison Capacity",
+    subtitle = "Rural counties (RUCC 7-9), 2019"
+  ) %>%
+  tab_spanner(
+    label   = "Mean Outcome by Group",
+    columns = c(overdose_mean, suicide_mean, divorce_mean, life_exp_mean)
+  ) %>%
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) %>%
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(columns = prison_cat)
+  ) %>%
+  tab_options(
+    table.font.size  = px(13),
+    data_row.padding = px(5)
+  )
+```

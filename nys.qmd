@@ -1,0 +1,71 @@
+---
+title: "nys"
+format: html
+---
+
+## New York State Analysis
+
+```{r}
+#| label: nys-subset
+nys_clean <- master_clean %>%
+  mutate(GEOID = str_pad(as.character(GEOID), width = 5, side = "left", pad = "0")) %>%
+  filter(str_sub(GEOID, 1, 2) == "36")
+
+nrow(nys_clean)   #NY has 62 counties
+```
+
+## #NYS data
+```{r}
+#domestic violence 2019
+#| label: nys-dv-join
+#| include: false
+
+dv_2019 <- read_excel("data/nys_dv_2019_clean.xlsx", sheet = "Wide (per county)")
+
+# Join onto the NY-only county dataset (built earlier)
+nys_clean <- nys_clean %>%
+  mutate(name_clean = str_remove(name, " County.*$")) %>%
+  left_join(dv_2019, by = c("name_clean" = "County")) %>%
+  select(-name_clean)
+
+# Check: how many counties failed to match (expect the 5 NYC counties, since
+# the DV file doesn't cover them)
+nys_clean %>%
+  st_drop_geometry() %>%
+  filter(is.na(dv_total_victims_2019)) %>%
+  pull(name)
+```
+
+```{r}
+#| label: nys-dv-join
+#| include: false
+
+dv_2019 <- read_excel("data/nys_dv_2019_clean.xlsx", sheet = "Wide (per county)")
+
+nys_clean <- nys_clean %>%
+  mutate(name_clean = str_remove(name, " County.*$"),
+         name_clean = str_remove_all(name_clean, "\\.")) %>%   # <- drop periods (e.g. "St." -> "St")
+  left_join(dv_2019, by = c("name_clean" = "County")) %>%
+  select(-name_clean)
+
+# Re-check: should now be ONLY the 5 NYC counties
+nys_clean %>%
+  st_drop_geometry() %>%
+  filter(is.na(dv_total_victims_2019)) %>%
+  pull(name)
+```
+
+```{r}
+identical(nys_clean$dv_total_victims_2019.x, nys_clean$dv_total_victims_2019.y)
+
+nys_clean <- nys_clean %>%
+  select(-ends_with(".y")) %>%
+  rename_with(~ str_remove(., "\\.x$"), ends_with(".x"))
+
+names(nys_clean)  
+```
+
+```{r}
+
+```
+

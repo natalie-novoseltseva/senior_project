@@ -1,0 +1,431 @@
+---
+title: "EDA"
+subtitle: "Prisons, Rurality, and County-Level Outcomes"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    embed-resources: true
+    code-fold: false
+    self-contained: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(readr)
+library(tibble)
+library(dplyr)
+library(readr)
+library(tidyverse)
+library(readxl)
+library(sf)
+library(BLSloadR)
+library(tidycensus)
+library(dplyr)
+library(purrr)
+library(corrplot)
+library(ggplot2)
+library(patchwork)
+library(gt)
+library(broom)
+library(knitr)
+```
+
+## Data
+
+```{r}
+#| label: load-data
+#for modeling/EDA
+master_clean <- read_csv("data/master_clean.csv")
+
+#for mapping
+master_clean_sf <- st_read("data/master_clean.geojson")
+```
+
+## EDA
+
+### Correlation matrix
+
+```{r}
+#| label: corr-index-vars
+#Index Variables
+master_clean %>%
+  select(overdose_rate, suicide_rate, homicide_rate, 
+         life_exp_weighted, divorce_rate) %>%
+  cor(use = "complete.obs") %>%
+  corrplot(
+    method  = "color",
+    type    = "upper",
+    addCoef.col = "black",
+    tl.col  = "black",
+    diag    = FALSE
+  )
+```
+
+```{r}
+#| label: corr-all-vars
+#All Variables
+master_clean %>%
+  st_drop_geometry() %>%
+  select(
+    # index components
+    overdose_rate, suicide_rate, life_exp_weighted, divorce_rate,
+    # independent variables
+    prison_present, num_open, capacity_total,
+    corr_employ_cat,
+    # controls
+    unemp_rate, log_medhhinc, pct_poverty,
+    pct_white, pct_black, pct_hispanic,
+    homeown_rate, rural, RUCC_2013, log_pop
+  ) %>%
+  mutate(corr_employ_num = as.numeric(factor(corr_employ_cat,
+                                levels = c("none", "suppressed", "reported")))) %>%
+  select(-corr_employ_cat) %>%
+  cor(use = "complete.obs") %>%
+  corrplot(
+    method      = "color",
+    type        = "upper",
+    addCoef.col = "black",
+    tl.col      = "black",
+    tl.cex      = 0.8,
+    number.cex  = 0.7,
+    diag        = FALSE
+  )
+
+```
+
+### Analysis of index variables
+
+```{r}
+#| label: zero-counts
+#a lot of 0s
+master_clean %>%
+  st_drop_geometry() %>%
+  summarise(
+    zero_overdose = sum(overdose_rate == 0, na.rm = TRUE),
+    zero_suicide  = sum(suicide_rate  == 0, na.rm = TRUE),
+    zero_corr_employment = sum(correctional_emplvl / tot_pop == 0, na.rm = TRUE)
+  )
+```
+
+```{r}
+#| label: fig-index-distributions
+#| fig-cap: "Distributions of index variables"
+#distrubutions of the index variables
+plot_dist <- function(var, label) {
+  ggplot(master_clean, aes(x = .data[[var]])) +
+    geom_histogram(fill = "steelblue", color = "white", bins = 50, na.rm = TRUE) +
+    geom_vline(aes(xintercept = median(.data[[var]], na.rm = TRUE)),
+               color = "red", linetype = "dashed") +
+    labs(title = label,
+         x = NULL, y = "Count") +
+    theme_minimal()
+}
+
+p1 <- plot_dist("overdose_rate",     "Drug Overdose Rate")
+p2 <- plot_dist("suicide_rate",      "Suicide Rate")
+p3 <- plot_dist("life_exp_weighted", "Life Expectancy (weighted)")
+p4 <- plot_dist("divorce_rate",      "Divorce Rate")
+
+(p1 + p2) / (p3 + p4)
+```
+
+```{r}
+#| label: fig-corr-employ-dist
+#| fig-cap: "Distribution of correctional employment (% of county population)"
+#distribution of correctional employment variable
+master_clean <- master_clean %>%
+  mutate(corr_employ_pct = correctional_emplvl / tot_pop)
+
+ggplot(master_clean, aes(x = corr_employ_pct)) +
+  geom_histogram(fill = "steelblue", color = "white", bins = 50) +
+  labs(title = "Distribution of Correctional Employment (% of County Population)",
+       x = "Correctional Employment Share", y = "Count") +
+  theme_minimal()
+```
+
+### Bivariate analysis
+
+```{r}
+#| label: prison-summary-table
+#summary comparison: prison vs non-prison counties
+master_clean %>%
+  st_drop_geometry() %>%
+  mutate(prison_group = ifelse(prison_present == 1, 
+                               "Prison County", "No Prison")) %>%
+  group_by(prison_group) %>%
+  summarise(
+    n              = n(),
+    overdose_mean  = mean(overdose_rate,     na.rm = TRUE),
+    suicide_mean   = mean(suicide_rate,      na.rm = TRUE),
+    life_exp_mean  = mean(life_exp_weighted, na.rm = TRUE),
+    divorce_mean   = mean(divorce_rate,      na.rm = TRUE),
+    medhhinc_mean  = mean(medhhinc,          na.rm = TRUE),
+    unemp_mean     = mean(unemp_rate,        na.rm = TRUE),
+    pct_rural_mean = mean(rural,             na.rm = TRUE)
+  ) %>%
+  pivot_longer(-prison_group) %>%
+  pivot_wider(names_from = prison_group, values_from = value) %>%
+  mutate(name = recode(name,
+    "n"              = "N (counties)",
+    "overdose_mean"  = "Drug Overdose Rate",
+    "suicide_mean"   = "Suicide Rate",
+    "life_exp_mean"  = "Life Expectancy",
+    "divorce_mean"   = "Divorce Rate",
+    "medhhinc_mean"  = "Median Household Income",
+    "unemp_mean"     = "Unemployment Rate",
+    "pct_rural_mean" = "Share Rural"
+  )) %>%
+  gt() %>%
+  cols_label(
+    name            = "Variable",
+    `No Prison`     = "No Prison",
+    `Prison County` = "Prison County"
+  ) %>%
+  fmt_number(
+    columns  = c(`No Prison`, `Prison County`),
+    rows     = name != "N (counties)",
+    decimals = 3
+  ) %>%
+  fmt_integer(
+    columns = c(`No Prison`, `Prison County`),
+    rows    = name == "N (counties)"
+  ) %>%
+  tab_header(
+    title    = "Descriptive Statistics by Prison Presence",
+    subtitle = "County-level means, 2019"
+  ) %>%
+  tab_spanner(
+    label   = "Group",
+    columns = c(`No Prison`, `Prison County`)
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = "#f0f0f0"),
+    locations = cells_body(rows = seq(1, 8, 2))
+  ) %>%
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  )
+```
+
+### Significance tests
+
+#### Main outcome variables
+
+```{r}
+#| label: prison-ttest-table
+outcomes <- c("overdose_rate", "suicide_rate", 
+              "life_exp_weighted", "divorce_rate")
+
+prison_table <- map_dfr(outcomes, function(var) {
+  t <- t.test(master_clean[[var]] ~ master_clean$prison_present,
+              na.action = na.omit)
+  tibble(
+    variable       = var,
+    mean_no_prison = t$estimate[1],
+    mean_prison    = t$estimate[2],
+    difference     = t$estimate[2] - t$estimate[1],
+    p_value        = t$p.value
+  )
+}) %>%
+  mutate(variable = recode(variable,
+    "overdose_rate"     = "Drug Overdose Rate",
+    "suicide_rate"      = "Suicide Rate",
+    "life_exp_weighted" = "Life Expectancy (weighted)",
+    "divorce_rate"      = "Divorce Rate"
+  )) %>%
+  gt() %>%
+  cols_label(
+    variable       = "Outcome",
+    mean_no_prison = "No Prison",
+    mean_prison    = "Prison County",
+    difference     = "Difference",
+    p_value        = "p-value"
+  ) %>%
+  fmt_number(columns = c(mean_no_prison, mean_prison, difference),
+             decimals = 3) %>%
+  fmt_number(columns = p_value, decimals = 4) %>%
+  tab_header(
+    title    = "Comparison of Outcomes: Prison vs. Non-Prison Counties",
+    subtitle = "Two-sample t-tests, 2019 county-level data"
+  ) %>%
+  tab_spanner(
+    label   = "Group Means",
+    columns = c(mean_no_prison, mean_prison)
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = "#f0f0f0"),
+    locations = cells_body(rows = c(1, 3))
+  ) %>%
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  )
+
+prison_table
+```
+
+#### Urban vs. Rural
+
+```{r}
+#| label: rural-ttest-table
+outcomes <- c("overdose_rate", "suicide_rate", 
+              "life_exp_weighted", "divorce_rate")
+
+rural_table <- map_dfr(outcomes, function(var) {
+  t <- t.test(master_clean[[var]] ~ master_clean$rural,
+              na.action = na.omit)
+  tibble(
+    variable    = var,
+    mean_urban  = t$estimate[1],
+    mean_rural  = t$estimate[2],
+    difference  = t$estimate[2] - t$estimate[1],
+    p_value     = t$p.value
+  )
+}) %>%
+  mutate(variable = recode(variable,
+    "overdose_rate"     = "Drug Overdose Rate",
+    "suicide_rate"      = "Suicide Rate",
+    "life_exp_weighted" = "Life Expectancy (weighted)",
+    "divorce_rate"      = "Divorce Rate"
+  )) %>%
+  gt() %>%
+  cols_label(
+    variable   = "Outcome",
+    mean_urban = "Urban",
+    mean_rural = "Rural",
+    difference = "Difference",
+    p_value    = "p-value"
+  ) %>%
+  fmt_number(columns = c(mean_urban, mean_rural, difference),
+             decimals = 3) %>%
+  fmt_number(columns = p_value, decimals = 4) %>%
+  tab_header(
+    title    = "Comparison of Outcomes: Rural vs. Urban Counties",
+    subtitle = "Two-sample t-tests, 2019 county-level data"
+  ) %>%
+  tab_spanner(
+    label   = "Group Means",
+    columns = c(mean_urban, mean_rural)
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = "#f0f0f0"),
+    locations = cells_body(rows = c(1, 3))
+  ) %>%
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  )
+
+rural_table
+```
+
+### OLS
+
+```{r}
+#| label: ols-setup
+main_iv  <- "prison_present"   
+controls <- c("log_medhhinc", "unemp_rate", "pct_poverty",
+              "pct_white", "homeown_rate", "RUCC_2013", 
+              "log_pop", "corr_employ_pct")
+
+outcomes <- list(
+  "Drug Overdose Rate"         = "overdose_rate",
+  "Suicide Rate"               = "suicide_rate",
+  "Life Expectancy (weighted)" = "life_exp_weighted",
+  "Divorce Rate"               = "divorce_rate"
+)
+
+term_labels <- c(
+  #"num_prisons"     = "Number of Prisons",
+  "prison_present"  = "Prison Present (binary)",
+  "log_medhhinc"    = "Log Median HH Income",
+  "unemp_rate"      = "Unemployment Rate",
+  "pct_poverty"     = "Poverty Rate",
+  "pct_white"       = "% White",
+  "homeown_rate"    = "Homeownership Rate",
+  "RUCC_2013"       = "Rural-Urban Continuum Code",
+  "log_pop"         = "Log Population",
+  "corr_employ_pct" = "Correctional Employment (%)",
+  "(Intercept)"     = "Intercept"
+)
+
+subsets <- list(
+  "Urban (RUCC 1-3)"      = master_clean %>% filter(RUCC_2013 <= 3),
+  "Semi-Rural (RUCC 4-6)" = master_clean %>% filter(RUCC_2013 >= 4 & RUCC_2013 <= 6),
+  "Rural (RUCC 7-9)"      = master_clean %>% filter(RUCC_2013 >= 7)
+)
+```
+
+#### Full Sample
+
+```{r}
+#| label: ols-full-sample
+#| results: asis
+
+run_models_gt <- function(data, subtitle = NULL) {
+  walk(names(outcomes), function(name) {
+    var     <- outcomes[[name]]
+    formula <- as.formula(paste(var, "~", main_iv, "+",
+                                paste(controls, collapse = " + ")))
+    fit     <- lm(formula, data = data)
+
+    tbl <- tidy(fit, conf.int = TRUE) %>%
+      mutate(
+        term = recode(term, !!!term_labels),
+        sig  = case_when(
+          p.value < 0.001 ~ "***",
+          p.value < 0.01  ~ "**",
+          p.value < 0.05  ~ "*",
+          p.value < 0.1   ~ ".",
+          TRUE            ~ ""
+        )
+      ) %>%
+      select(term, estimate, std.error, statistic, p.value, sig) %>%
+      gt() %>%
+      cols_label(
+        term      = "Variable",
+        estimate  = "Coefficient",
+        std.error = "Std. Error",
+        statistic = "t-stat",
+        p.value   = "p-value",
+        sig       = ""
+      ) %>%
+      fmt_number(columns = c(estimate, std.error, statistic), decimals = 3) %>%
+      fmt_number(columns = p.value, decimals = 4) %>%
+      tab_header(
+        title    = paste("OLS Model:", name),
+        subtitle = subtitle
+      ) %>%
+      tab_style(
+        style     = cell_text(weight = "bold"),
+        locations = cells_column_labels()
+      )
+
+    print(htmltools::tagList(tbl))
+  })
+}
+
+run_models_gt(master_clean)
+```
+
+#### Sub-samples by Rurality
+
+```{r}
+#| label: ols-subsamples
+#| results: asis
+
+walk(names(subsets), function(subset_name) {
+  run_models_gt(subsets[[subset_name]], subtitle = subset_name)
+})
+```
+
+
