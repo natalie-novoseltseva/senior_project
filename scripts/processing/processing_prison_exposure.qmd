@@ -165,31 +165,36 @@ time; after that the saved file is read.
 
 ```{r}
 #| label: tract-exposure
-#| label: tract-exposure-compute
 #| eval: false
 # One-time computation of tract exposure to prisons. Slow and memory-heavy.
 # Not run when rendering; the saved file is read in the next chunk.
 # Each prison adds exp(-distance / h).
-#prison_info <- prisons %>%
-#  st_drop_geometry() %>%
-#  transmute(prison_id = row_number())
+prison_info <- prisons %>%
+  st_drop_geometry() %>%
+  transmute(prison_id = row_number())
 
-#tibble(
-#  GEOID     = rep(tract_pts$GEOID, times = nrow(prisons)),
-#  prison_id = rep(prison_info$prison_id, each = nrow(tract_pts)),
-#  d_km      = as.numeric(st_distance(tract_pts, prisons)) / 1000
-#) %>%
-#  left_join(prison_info, by = "prison_id") %>%
-#  group_by(GEOID) %>%
-#  summarise(
-#    dist_nearest_prison_km = min(d_km),
+tibble(
+  GEOID     = rep(tract_pts$GEOID, times = nrow(prisons)),
+  prison_id = rep(prison_info$prison_id, each = nrow(tract_pts)),
+  d_km      = as.numeric(st_distance(tract_pts, prisons)) / 1000
+) %>%
+  left_join(prison_info, by = "prison_id") %>%
+  group_by(GEOID) %>%
+  summarise(
+    dist_nearest_prison_km = min(d_km),
     # every prison counts 1
-#    prison_exp_h1   = sum(exp(-d_km / 1)),
-#    prison_exp_h5   = sum(exp(-d_km / 5)),
-#    prison_exp_h10  = sum(exp(-d_km / 10)),
-#    prison_exp_h25  = sum(exp(-d_km / 25)),
-#  ) %>%
-#  write_csv("data/final/tract_prison_exposure.csv")
+    prison_exp_h1   = sum(exp(-d_km / 1)),
+    prison_exp_h5   = sum(exp(-d_km / 5)),
+    prison_exp_h10  = sum(exp(-d_km / 10)),
+    prison_exp_h25  = sum(exp(-d_km / 25)),
+    # number of prisons in each distance ring (rings don't overlap)
+    ring_0_2   = sum(d_km < 2),
+    ring_2_5 = sum(d_km >= 2  & d_km < 5),
+    ring_5_10  = sum(d_km >= 5  & d_km < 10),
+    ring_10_25 = sum(d_km >= 10 & d_km < 25),
+    ring_25_50 = sum(d_km >= 25 & d_km < 50)
+  ) %>%
+  write_csv("data/final/tract_prison_exposure.csv")
 ```
 
 ```{r}
@@ -217,7 +222,8 @@ puma_exposure_decay <- tract_exposure %>%
   filter(!is.na(GEOID20), pop_noninst > 0) %>%
   group_by(GEOID20) %>%
   summarise(
-    across(all_of(exposure_vars), ~ weighted.mean(.x, pop_noninst)),
+    across(c(dist_nearest_prison_km, starts_with("prison_exp"), starts_with("ring_")),
+           ~ weighted.mean(.x, pop_noninst)),
     n_tracts_exposure = n()
   ) %>%
   rename(dist_nearest_prison_km_popw = dist_nearest_prison_km)   # distance for the average resident
