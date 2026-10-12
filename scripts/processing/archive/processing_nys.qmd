@@ -1,0 +1,1400 @@
+---
+title: "processing_nys"
+format: html
+---
+
+```{r}
+library(readr)
+library(tibble)
+library(dplyr)
+library(readr)
+library(tidyverse)
+library(readxl)
+library(sf)
+library(BLSloadR)
+library(tidycensus)
+library(dplyr)
+library(purrr)
+
+```
+
+Data
+
+ACS-5
+```{r}
+years <- c(2019, 2020, 2021, 2023, 2024)
+
+my_vars <- c(
+  # Population & demographics
+  tot_pop       = "B01003_001",
+  median_age    = "B01002_001",
+  white         = "C02003_003",
+  black         = "C02003_004",
+  asian         = "C02003_006",
+  hispanic      = "B03001_003",
+
+  # Economic wellbeing
+  medhhinc      = "B25119_001",
+  pop_poverty   = "B17001_002",
+  pop_poverty_universe = "B17001_001",
+  labor_force   = "B23025_003",
+  unemployed    = "B23025_005",
+
+  # Housing
+  hu_ownocc     = "B25003_002",
+  tot_hu        = "B25001_001",
+  rent_burden_30_35   = "B25070_007",  # 30.0-34.9%
+  rent_burden_35_40   = "B25070_008",  # 35.0-39.9%
+  rent_burden_40_50   = "B25070_009",  # 40.0-49.9%
+  rent_burden_50plus  = "B25070_010",  # 50.0%+
+  rent_total          = "B25070_001",
+
+  # Education
+  edu_hs_or_less     = "B15003_017",
+  edu_bachelors_plus = "B15003_022",
+  edu_total          = "B15003_001",
+
+  # Family structure
+  divorced_m    = "B12001_010",
+  divorced_f    = "B12001_019",
+  single_dad_children = "B11003_010",   # male householder, no wife, with own children <18
+  single_mom_children = "B11003_016"   # female householder, no husband, with own children <18
+
+)
+
+# Pulling the Census variables for New York State, at the county level
+census_data_nys <- map_dfr(
+  years,
+  ~ get_acs(
+      geography = "county",
+      variables = my_vars,
+      state = "NY",
+      year = .x,
+      survey = "acs5",
+      geometry = FALSE,
+      cache_table = TRUE
+    ) %>%
+    mutate(year = .x)
+  ) %>%
+  select(GEOID, NAME, variable, estimate, year) %>%
+  pivot_wider(names_from = variable, values_from = estimate) %>%
+  arrange(NAME, year)
+
+census_data_nys <- census_data_nys %>%
+  mutate(divorced = divorced_m + divorced_f)
+```
+
+Prisons (ICPSR)
+```{r}
+#US Prisons (from ICPSR)
+#The raw dataset contains 6,468 prison facilities with geographic boundaries.
+#Three filters are applied: (1) only facilities with STATUS "OPEN" or "CLOSED" are
+#retained, dropping ambiguous or unknown statuses; (2) TYPE "COUNTY" is excluded,
+#removing local jails which were not sited as economic development tools and do not
+#fit the theoretical framework of the study; (3) restricted to New York State.
+#The cleaned dataset is then collapsed to the county level using COUNTYFIPS,
+#producing counts and capacity/population totals broken out by status (open, closed, and combined).
+prisons_icpsr <- st_read("data/prison-boundaries-1-geojson.geojson")
+#names(prisons_icpsr)
+
+prisons_clean_nys <- prisons_icpsr %>%
+  st_drop_geometry() %>%
+  filter(
+    STATUS %in% c("OPEN", "CLOSED"),
+    TYPE != "COUNTY",
+    STATE == "NY"
+  )
+
+prisons_by_county_nys <- prisons_clean_nys %>%
+  group_by(COUNTYFIPS) %>%
+  summarise(
+    num_prisons        = n(),
+    num_open           = sum(STATUS == "OPEN"),
+    num_closed         = sum(STATUS == "CLOSED"),
+    capacity_total     = sum(CAPACITY, na.rm = TRUE),
+    capacity_open      = sum(CAPACITY[STATUS == "OPEN"],   na.rm = TRUE),
+    capacity_closed    = sum(CAPACITY[STATUS == "CLOSED"], na.rm = TRUE),
+    pop_total          = sum(POPULATION, na.rm = TRUE),
+    pop_open           = sum(POPULATION[STATUS == "OPEN"],   na.rm = TRUE),
+    pop_closed         = sum(POPULATION[STATUS == "CLOSED"], na.rm = TRUE)
+  )
+
+```
+
+Death counts
+```{r}
+#death counts and death rates for drug overdose, suicide, homicide and firearm injuries by county of residence
+
+#The raw dataset contains county-level death counts and rates for drug overdose,
+#firearm injuries, homicide, and suicide across multiple years. The data is filtered
+#to 2019 and restricted to three Intent categories relevant to the distress index:
+#Drug_OD, All_Suicide, and All_Homicide. Firearm-specific subcategories (FA_Suicide,
+#FA_Homicide, FA_Deaths) are dropped to avoid double-counting, as they are subsets
+#of the all-cause homicide and suicide totals. Rate is coerced to numeric, and the
+#dataset is pivoted to wide format so each county appears as a single row with
+#separate rate columns for each outcome. Small cell counts (1-9 deaths) reported
+#as ranges by the CDC are handled by using the pre-computed Rate column directly,
+#bypassing the suppression issue in the Count column entirely.
+
+
+injury_overdose_violence <- read_csv("data/injury_overdose_violence.csv")
+
+
+#2019-2024
+injury_overdose_violence_nys <- injury_overdose_violence %>%
+  filter(ST_NAME == "New York") %>%
+  filter(Period %in% c("2019", "2020", "2021", "2023", "2024")) %>%   
+  filter(Intent %in% c("Drug_OD", "All_Suicide", "All_Homicide")) %>%
+  mutate(Rate = as.numeric(Rate)) %>%
+  pivot_wider(
+    id_cols    = c(GEOID, NAME, ST_GEOID, ST_NAME, Period),   
+    names_from = Intent,
+    values_from = Rate,
+    names_glue = "{Intent}_rate"
+  ) %>%
+  rename(
+    overdose_rate = Drug_OD_rate,
+    suicide_rate  = All_Suicide_rate,
+    homicide_rate = All_Homicide_rate,
+    year = Period
+  )
+
+
+```
+
+Unemployment (BLS)
+```{r}
+#BLS (unemployment rate)
+
+# The raw BLS county unemployment file for 2019 is structured with the title row
+# as the first row and the actual column headers as the second row, a common BLS
+# formatting issue. The column names are manually assigned via set_names(), and the
+# spurious header row is dropped with slice(-1). Trailing footnote rows are removed
+# by filtering out blank state FIPS values. State and county FIPS codes, stored in
+# separate columns in the raw file, are padded to 2 and 3 digits respectively and
+# concatenated into a single 5-digit GEOID to match the join key used across all
+# other datasets. All numeric columns are coerced from character, and the dataset
+# is reduced to the GEOID, county name, and core labor force variables.
+
+unemployment_2019 <- read_excel("data/unemployment19.xlsx")
+
+unemployment_2019_clean <- unemployment_2019 %>%
+  set_names(c("laus_code", "state_fips", "county_fips", 
+              "county_name", "year", "labor_force", 
+              "employed", "unemployed", "unemp_rate")) %>%
+  slice(-1) %>%                                        
+  filter(!is.na(state_fips), state_fips != "") %>%     
+  mutate(
+    GEOID     = paste0(
+                  str_pad(state_fips,  2, pad = "0"),
+                  str_pad(county_fips, 3, pad = "0")
+                ),
+    unemp_rate = as.numeric(unemp_rate),
+    labor_force = as.numeric(labor_force),
+    employed    = as.numeric(employed),
+    unemployed  = as.numeric(unemployed)
+  ) %>%
+  select(GEOID, county_name, labor_force, employed, unemployed, unemp_rate)
+```
+
+Urban vs. Rural counties (USDA)
+```{r}
+#Urban vs. Rural counties (from USDA)
+#2023
+rural_2023 <- read_csv("data/rural_urban_codes2023.csv") #1-3:urban, 4-9:rural
+
+rural_2023_nys <- rural_2023 %>%
+  pivot_wider(
+    names_from = Attribute,
+    values_from = Value
+  ) %>% 
+  mutate(
+    Population_2020 = as.numeric(Population_2020),
+    RUCC_2023 = as.numeric(RUCC_2023)
+  ) %>% 
+  filter(State == "NY")
+
+
+
+#2013
+# The 2013 Rural-Urban Continuum Codes (RUCC) from the USDA are already in wide
+# format with one row per county. The only cleaning needed is renaming FIPS to GEOID
+# for consistency with the join key used across all other datasets, and creating a
+# binary rural indicator following the standard USDA convention where codes 1-3
+# denote metro (urban) counties and codes 4-9 denote nonmetro (rural) counties.
+# The 2013 vintage is used rather than 2023 because it predates the 2019 outcome
+# year, which is the methodologically appropriate choice.
+
+#rural_2013 <- read_excel("data/rural_urban_codes2013.xls")
+
+#rural_2013_clean <- rural_2013 %>%
+#  rename(GEOID = FIPS) %>%
+#  mutate(rural = as.integer(RUCC_2013 >= 4)) %>%
+#  select(GEOID, State, County_Name, Population_2010, RUCC_2013, rural, Description)
+```
+
+Life Expectancy (from CDC, 2010-2015)
+
+```{r}
+# Life expectancy data comes from the USALEEP project (2010-2015), the most
+# comprehensive source of county-level life expectancy available for the contiguous
+# US. The raw file is at the census tract level, so it must be aggregated to the
+# county level. Rather than a simple mean, a population-weighted mean is computed
+# so that more populous tracts contribute proportionally more to the county estimate.
+# Tract-level population denominators are pulled from the 2011-2015 ACS 5-year
+# estimates (variable B01003_001) via tidycensus, restricted to New York State only.
+# A county FIPS crosswalk is constructed from the built-in fips_codes dataframe in
+# tidycensus and joined to the life expectancy file on county name. Tract numbers
+# in the USALEEP file (e.g. "0201.00") are reformatted into standard 11-digit Census
+# GEOIDs by removing the decimal point, padding to 6 digits, and prepending the
+# 5-digit county FIPS code. The 2010-2015 vintage is used as it is the only
+# nationally comprehensive county-level life expectancy dataset available; this
+# measurement lag relative to the outcome year(s) is acknowledged as a limitation.
+
+life_expectancy <- read_csv("data/life_expectancy_2010-2015.csv")
+
+# Pull tract-level population for New York only (state FIPS "36"), no loop needed
+tract_pop <- get_acs(
+  geography = "tract",
+  variables = c(tract_pop = "B01003_001"),
+  state     = "NY",
+  year      = 2015,
+  survey    = "acs5",
+  geometry  = FALSE
+) %>%
+  select(GEOID, tract_pop = estimate)
+
+fips_xwalk <- fips_codes %>%
+  filter(state == "NY") %>%
+  mutate(
+    county_full = paste0(county, ", ", state),
+    county_fips = paste0(state_code, county_code)
+  ) %>%
+  select(county_full, county_fips)
+
+life_expectancy_clean <- life_expectancy %>%
+  janitor::clean_names() %>%
+  filter(county != "(blank)", !is.na(census_tract_number)) %>%
+  left_join(fips_xwalk, by = c("county" = "county_full")) %>%
+  filter(!is.na(county_fips)) %>%     # drops all non-NY counties, since they won't match the NY-only crosswalk
+  mutate(
+    tract_clean = str_remove(census_tract_number, "\\.") %>%
+                  str_pad(6, pad = "0"),
+    GEOID = paste0(county_fips, tract_clean)
+  )
+
+life_expectancy_county_nys <- life_expectancy_clean %>%
+  left_join(tract_pop, by = "GEOID") %>%
+  group_by(county_fips, state, county) %>%
+  summarise(
+    life_exp_weighted = weighted.mean(life_expectancy,
+                                      w     = tract_pop,
+                                      na.rm = TRUE),
+    n_tracts = n()
+  ) %>%
+  ungroup() %>%
+  rename(GEOID = county_fips)
+```
+
+
+Occupation - Correctional Institution
+```{r}
+correctional_employment_2019 <- read_csv("data/correctional_employment_2019.csv")
+correctional_employment_2020 <- read_csv("data/correctional_employment_2020.csv")
+correctional_employment_2021 <- read_csv("data/correctional_employment_2021.csv")
+correctional_employment_2022 <- read_csv("data/correctional_employment_2022.csv")
+correctional_employment_2023 <- read_csv("data/correctional_employment_2023.csv")
+correctional_employment_2024 <- read_csv("data/correctional_employment_2024.csv")
+
+
+# QCEW correctional employment (NAICS 92214), 2019
+# Due to disclosure suppression affecting 88% of county-level records,
+# employment is coded as a three-category variable rather than a continuous measure.
+
+library(dplyr)
+library(purrr)
+library(tidyr)
+
+years_needed <- c(2019, 2020, 2021, 2022, 2023, 2024)
+
+# Map each year to its correct county-level agglvl_code
+# (77 for years where QCEW used the older scheme, 78 for 2024's new scheme)
+agglvl_lookup <- c(
+  "2019" = 77,
+  "2020" = 77,
+  "2021" = 77,
+  "2022" = 77,
+  "2023" = 77,
+  "2024" = 78
+)
+
+occupation_nys_19_24 <- map_dfr(years_needed, function(yr) {
+  file_path <- paste0("data/correctional_employment_", yr, ".csv")
+  occ_raw <- read_csv(file_path, show_col_types = FALSE)
+  
+  target_code <- agglvl_lookup[[as.character(yr)]]
+
+  occ_raw %>%
+    filter(
+      agglvl_code == target_code,
+      substr(area_fips, 1, 2) == "36"
+    ) %>%
+    group_by(area_fips) %>%
+    summarise(
+      correctional_emplvl = sum(annual_avg_emplvl, na.rm = TRUE),
+      any_suppressed      = any(disclosure_code == "N"),
+      any_reported        = any(is.na(disclosure_code) & annual_avg_emplvl > 0),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      corr_employ_cat = case_when(
+        any_reported   ~ "reported",
+        any_suppressed ~ "suppressed",
+        TRUE           ~ "none"
+      ),
+      year = yr
+    ) %>%
+    rename(GEOID = area_fips)
+})
+
+nrow(occupation_nys_19_24)
+table(occupation_nys_19_24$year)
+```
+
+
+##Domestic Violence
+```{r}
+#2019-2024
+nys_violence_2019_raw <- read_excel("data/nys_violence_2019.xls")
+nys_violence_2020_raw <- read_excel("data/nys_violence_2020.xls")
+nys_violence_2021_raw <- read_excel("data/nys_violence_2021.xls")
+nys_violence_2022_raw <- read_excel("data/nys_violence_2022.xls")
+nys_violence_2023_raw <- read_excel("data/nys_violence_2023.xls")
+nys_violence_2024_raw <- read_excel("data/nys_violence_2024.xlsx")
+
+nys_violence_2019 <- nys_violence_2019_raw %>%
+  rename(
+    county = 1,
+    offense_type = 2,
+    female_intimate_partner = 3,
+    male_intimate_partner = 4,
+    total_intimate_partner = 5,
+    other_family_victim = 6,
+    total_all_victims = 7
+  ) %>%
+  mutate(across(c(female_intimate_partner:total_all_victims), as.numeric))
+
+nys_violence_2019 <- nys_violence_2019 %>%
+  fill(county)  
+
+nys_violence_2019 <- nys_violence_2019 %>%
+  pivot_longer(
+    cols = c(female_intimate_partner, male_intimate_partner, other_family_victim),
+    names_to = "victim_type",
+    values_to = "count"
+  )
+
+nys_violence_2019 <- nys_violence_2019 %>%
+  filter(!is.na(county), !county %in% c("DOMESTIC VIOLENCE VICTIMS REPORTED IN 2019", "NON-NEW YORK CITY COUNTIES"))
+
+nys_violence_2019 <- nys_violence_2019 %>%
+  mutate(year = 2019)
+
+nys_violence_2019 <- nys_violence_2019 %>%
+  slice(1:(n() - 21))
+```
+
+```{r}
+nys_violence_all <- map_dfr(years_needed, function(yr) {
+  ext <- if (yr == 2024) "xlsx" else "xls"
+  file_path <- paste0("data/nys_violence_", yr, ".", ext)
+  raw <- read_excel(file_path)
+  
+  raw %>%
+    rename(
+      county = 1,
+      offense_type = 2,
+      female_intimate_partner = 3,
+      male_intimate_partner = 4,
+      total_intimate_partner = 5,
+      other_family_victim = 6,
+      total_all_victims = 7
+    ) %>%
+    mutate(across(c(female_intimate_partner:total_all_victims), as.numeric)) %>%
+    fill(county) %>%
+    pivot_longer(
+      cols = c(female_intimate_partner, male_intimate_partner, other_family_victim),
+      names_to = "victim_type",
+      values_to = "count"
+    ) %>%
+    filter(
+      !is.na(county),
+      !grepl("DOMESTIC VIOLENCE VICTIMS REPORTED IN", county),
+      county != "NON-NEW YORK CITY COUNTIES"
+    ) %>%
+    mutate(year = yr)
+})
+
+nys_violence_wide <- nys_violence_all %>%
+  pivot_wider(
+    id_cols = c(county, year),
+    names_from = c(offense_type, victim_type),
+    values_from = count,
+    names_glue = "{offense_type}_{victim_type}"
+  )
+```
+
+##Deaths in custody
+
+```{r}
+
+
+library(dplyr)
+library(lubridate)
+library(stringr)
+
+deaths_in_custody_nys <- read_csv("data/deaths_in_custody_nys.csv")
+
+deaths_clean <- deaths_in_custody_nys %>%
+  mutate(
+    death_year = year(ymd(DEATH_DATE)),
+    facility_name_clean = trimws(toupper(FACILITY_NAME))
+  ) %>%
+  filter(death_year >= 2019, death_year <= 2024)
+
+# Check facility name overlap with your existing prisons data before joining
+prisons_clean_match_names <- prisons_clean %>%
+  mutate(name_clean = trimws(toupper(NAME)))
+
+setdiff(unique(deaths_clean$facility_name_clean), unique(prisons_clean_match_names$name_clean))
+```
+
+```{r}
+facility_crosswalk <- c(
+  "GREEN HAVEN" = "GREEN HAVEN CORRECTIONAL FACILITY",
+  "MOHAWK" = "MOHAWK CORRECTIONAL FACILITY",
+  "AUBURN" = "AUBURN CORRECTIONAL FACILITY",                    # not Residential Center
+  "GREAT MEADOW" = "GREAT MEADOW CORRECTIONAL FACILITY",
+  "WENDE" = "WENDE CORRECTIONAL FACILITY",
+  "SING SING" = "SING SING CORRECTIONAL FACILITY",
+  "ATTICA" = "ATTICA CORRECTIONAL FACILITY",
+  "COXSACKIE" = "COXSACKIE CORRECTIONAL FACILITY",
+  "FISHKILL" = "FISHKILL CORRECTIONAL FACILITY",
+  "GREENE" = "GREENE CORRECTIONAL FACILITY",
+  "RIVERVIEW" = "RIVERVIEW CORRECTIONAL FACILITY",
+  "SHAWANGUNK" = "SHAWANGUNK CORRECTIONAL FACILITY",
+  "CLINTON" = "CLINTON CORRECTIONAL FACILITY - MAIN",           # NOTE: also "- ANNEX" exists, see below
+  "BEDFORD HILLS" = "BEDFORD HILLS CORRECTIONAL FACILITY",
+  "ELMIRA" = "ELMIRA CORRECTIONAL FACILITY",
+  "MID-STATE" = "MID-STATE CORRECTIONAL FACILITY",
+  "GROVELAND" = "GROVELAND CORRECTIONAL FACILITY",              # not GROVELAND ANNEX
+  "FIVE POINTS" = "FIVE POINTS CORRECTIONAL FACILITY",
+  "WOODBOURNE" = "WOODBOURNE CORRECTIONAL FACILITY",
+  "QUEENSBORO" = "QUEENSBORO CORRECTIONAL FACILITY",
+  "ULSTER" = "ULSTER CORRECTIONAL FACILITY",
+  "GOWANDA" = "GOWANDA CORRECTIONAL FACILITY",
+  "WASHINGTON" = "WASHINGTON CORRECTIONAL FACILITY",
+  "CAPE VINCENT" = "CAPE VINCENT CORRECTIONAL FACILITY",
+  "BARE HILL" = "BARE HILL CORRECTIONAL FACILITY",
+  "CAYUGA" = "CAYUGA CORRECTIONAL FACILITY",
+  "OTISVILLE" = "OTISVILLE CORRECTIONAL FACILITY",              # not FCI OTISVILLE (federal)
+  "EASTERN" = "EASTERN NY CORRECTIONAL FACILITY",                # corrected - not "EASTERN CORRECTIONAL FACILITY"
+  "MARCY" = "MARCY CORRECTIONAL FACILITY",
+  "LAKEVIEW" = "LAKEVIEW SHOCK INCARCERATION CORRECTIONAL FACILITY",  # NOTE: also "- ANNEX" exists
+  "ROCHESTER" = "ROCHESTER CORRECTIONAL FACILITY",
+  "SULLIVAN" = "SULLIVAN CORRECTIONAL FACILITY",
+  "ALBION" = "ALBION CORRECTIONAL FACILITY",
+  "DOWNSTATE" = "DOWNSTATE CORRECTIONAL FACILITY",
+  "FRANKLIN" = "FRANKLIN CORRECTIONAL FACILITY",
+  "ALTONA" = "ALTONA CORRECTIONAL FACILITY",
+  "GOUVERNEUR" = "GOUVERNEUR CORRECTIONAL FACILITY",
+  "COLLINS" = "COLLINS CORRECTIONAL FACILITY",
+  "ADIRONDACK" = "ADIRONDACK CORRECTIONAL FACILITY",             # not Residential Center or Wilderness Challenge
+  "SOUTHPORT" = "SOUTHPORT CORRECTIONAL FACILITY",
+  "WYOMING" = "WYOMING CORRECTIONAL FACILITY",
+  "UPSTATE" = "UPSTATE CORRECTIONAL FACILITY",
+  "HUDSON" = "HUDSON CORRECTIONAL FACILITY / WORK RELEASE",      # corrected - exact name differs
+  "WALLKILL" = "WALLKILL CORRECTIONAL FACILITY"
+)
+
+# Sanity check: every right-hand side should exist in your lookup
+setdiff(facility_crosswalk, ny_facility_lookup$name_clean)
+```
+
+```{r}
+ny_facility_lookup_full <- prisons_clean_match_names %>% 
+  filter(STATE == "NY") %>% 
+  select(name_clean, COUNTYFIPS, COUNTY)
+
+deaths_matched <- deaths_clean %>%
+  mutate(matched_name = facility_crosswalk[facility_name_clean]) %>%
+  left_join(ny_facility_lookup_full, by = c("matched_name" = "name_clean"))
+
+sum(is.na(deaths_matched$COUNTYFIPS))   # should be 0
+
+deaths_by_county_year <- deaths_matched %>%
+  group_by(COUNTYFIPS, COUNTY, death_year) %>%
+  summarise(n_deaths = n(), .groups = "drop") %>%
+  rename(GEOID = COUNTYFIPS, county_name = COUNTY, year = death_year)
+
+nrow(deaths_by_county_year)
+head(deaths_by_county_year)
+```
+
+##Staffing levels and suicides
+```{r}
+library(readr)
+library(dplyr)
+library(lubridate)
+
+staffing_levels_nys <- read_csv("data/staffing_levels_nys.csv")
+suicides_nys <- read_csv("data/suicides_nys.csv")
+
+# --- SUICIDES ---
+suicides_matched <- suicides_nys %>%
+  mutate(facility_name_clean = trimws(toupper(FACILITY_NAME))) %>%
+  mutate(matched_name = facility_crosswalk[facility_name_clean]) %>%
+  left_join(ny_facility_lookup_full, by = c("matched_name" = "name_clean")) %>%
+  filter(SUICIDE_YEAR >= 2019, SUICIDE_YEAR <= 2024)
+
+sum(is.na(suicides_matched$COUNTYFIPS))   # check match rate
+
+suicides_by_county_year <- suicides_matched %>%
+  group_by(COUNTYFIPS, COUNTY, SUICIDE_YEAR) %>%
+  summarise(n_suicides = n(), .groups = "drop") %>%
+  rename(GEOID = COUNTYFIPS, county_name = COUNTY, year = SUICIDE_YEAR)
+
+# --- STAFFING ---
+staffing_matched <- staffing_levels_nys %>%
+  mutate(
+    facility_name_clean = trimws(toupper(FACILITY_NAME)),
+    report_year = year(ymd(REPORT_DATE))
+  ) %>%
+  mutate(matched_name = facility_crosswalk[facility_name_clean]) %>%
+  left_join(ny_facility_lookup_full, by = c("matched_name" = "name_clean")) %>%
+  filter(report_year >= 2019, report_year <= 2024, STAFFING_CATEGORY == "TOTAL")
+
+sum(is.na(staffing_matched$COUNTYFIPS))
+
+staffing_by_county_year <- staffing_matched %>%
+  group_by(COUNTYFIPS, COUNTY, report_year) %>%
+  summarise(
+    budgeted_fill = sum(BUDGETED_FILL_LEVEL, na.rm = TRUE),
+    actual_fill   = sum(ACTUAL_FILL_LEVEL, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(GEOID = COUNTYFIPS, county_name = COUNTY, year = report_year)
+```
+
+##Under custody
+```{r}
+under_custody_nys <- read_csv("data/under_custody_nys.csv")
+names(under_custody_nys)
+head(under_custody_nys, 5)
+```
+
+##Final Dataset
+```{r}
+library(dplyr)
+
+# Rename each static file's GEOID-equivalent column to GEOID for consistency
+prisons_static <- prisons_by_county_nys %>% rename(GEOID = COUNTYFIPS)
+rural_static <- rural_2023_nys %>% rename(GEOID = FIPS)   # adjust if the actual column name differs
+life_exp_static <- life_expectancy_county_nys              # already has GEOID
+
+# Build the master year x county panel starting from ACS, since it's your most complete file
+master_nys <- census_data_nys %>%
+  left_join(injury_overdose_violence_nys %>% mutate(year = as.numeric(year)), by = c("GEOID", "year")) %>%
+  left_join(occupation_nys_19_24, by = c("GEOID", "year")) %>%
+  left_join(deaths_by_county_year, by = c("GEOID", "year")) %>%
+  left_join(suicides_by_county_year, by = c("GEOID", "year")) %>%
+  left_join(staffing_by_county_year, by = c("GEOID", "year")) %>%
+  left_join(prisons_static, by = "GEOID") %>%
+  left_join(rural_static, by = "GEOID") %>%
+  left_join(life_exp_static, by = "GEOID")
+
+nrow(master_nys)
+names(master_nys)
+```
+
+```{r}
+master_nys <- master_nys %>%
+  mutate(county_name_final = coalesce(county_name.x, county_name.y, county_name, NAME.x, NAME.y)) %>%
+  select(-county_name.x, -county_name.y, -county_name, -NAME.x, -NAME.y) %>%
+  rename(county_name = county_name_final)
+```
+
+```{r}
+# Spot-check that county_name_final actually looks sane and consistent (not mixing formats like "Albany" vs "ALBANY COUNTY")
+master_nys %>% distinct(GEOID, county_name) %>% arrange(GEOID) %>% head(10)
+```
+
+```{r}
+# Build a clean, single, county-level name lookup from ACS (most complete + consistent source)
+county_name_lookup <- census_data_nys %>%
+  distinct(GEOID, NAME) %>%
+  mutate(county_name_clean = str_remove(NAME, " County, New York")) %>%
+  select(GEOID, county_name_clean)
+
+# Drop all the messy name columns and re-attach one clean version
+master_nys <- master_nys %>%
+  select(-any_of(c("county_name", "NAME.x", "NAME.y"))) %>%
+  left_join(county_name_lookup, by = "GEOID") %>%
+  rename(county_name = county_name_clean)
+
+# Verify: every GEOID should now have exactly ONE distinct name
+master_nys %>% distinct(GEOID, county_name) %>% count(GEOID) %>% filter(n > 1)
+```
+
+```{r}
+master_nys <- master_nys %>%
+  mutate(
+    n_deaths = replace_na(n_deaths, 0),
+    n_suicides = replace_na(n_suicides, 0),
+    budgeted_fill = replace_na(budgeted_fill, 0),
+    actual_fill = replace_na(actual_fill, 0),
+    correctional_emplvl = replace_na(correctional_emplvl, 0),
+    corr_employ_cat = replace_na(corr_employ_cat, "none"),
+    num_prisons = replace_na(num_prisons, 0),
+    num_open = replace_na(num_open, 0),
+    num_closed = replace_na(num_closed, 0),
+    capacity_total = replace_na(capacity_total, 0),
+    pop_total = replace_na(pop_total, 0)
+  )
+```
+
+```{r}
+unique(nys_violence_wide$county) %>% head(20)
+```
+
+```{r}
+# Confirm formats line up before trusting the join
+setdiff(unique(nys_violence_wide$county), unique(county_name_lookup$county_name_clean))
+```
+
+```{r}
+nys_violence_wide <- nys_violence_wide %>%
+  mutate(county = if_else(county == "St Lawrence", "St. Lawrence", county))
+```
+
+```{r}
+nys_violence_wide <- nys_violence_wide %>%
+  filter(
+    !grepl("^Source:", county),
+    !grepl("^Total is sum", county),
+    county != "Non-New York City Total"
+  )
+
+# Re-check after filtering
+setdiff(unique(nys_violence_wide$county), unique(county_name_lookup$county_name_clean))
+```
+
+```{r}
+nys_violence_wide_joined <- nys_violence_wide %>%
+  left_join(county_name_lookup, by = c("county" = "county_name_clean")) %>%
+  rename(county_name = county)
+
+sum(is.na(nys_violence_wide_joined$GEOID))   # should be 0
+
+master_nys <- master_nys %>%
+  left_join(
+    nys_violence_wide_joined %>% select(-county_name),
+    by = c("GEOID", "year")
+  )
+
+nrow(master_nys)   # should still be 310
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Crime Data (FBI)
+```{r}
+
+```
+
+
+```{r}
+# fix -999 sentinel values in prisons before joining
+prisons_by_county <- prisons_by_county %>%
+  rename(GEOID = COUNTYFIPS) %>%
+  mutate(across(where(is.numeric), ~na_if(., -999L)))
+
+# master join
+master <- census_data %>%
+  left_join(prisons_by_county,             by = "GEOID") %>%
+  left_join(injury_overdose_violence_2019, by = "GEOID") %>%
+  left_join(unemployment_2019_clean,       by = "GEOID") %>%
+  left_join(rural_2013_clean,              by = "GEOID") %>%
+  left_join(life_expectancy_county,        by = "GEOID") %>%
+  left_join(occupation_clean,              by = "GEOID") %>%
+  mutate(
+    corr_employ_cat     = replace_na(corr_employ_cat, "none"),
+    correctional_emplvl = replace_na(correctional_emplvl, 0)
+  ) %>%
+  filter(
+    !str_starts(GEOID, "02"),  # drop Alaska
+    !str_starts(GEOID, "15")   # drop Hawaii
+  )
+
+master <- master %>%
+  filter(str_length(GEOID) == 5,           # ensure proper county FIPS
+         str_starts(GEOID, "0[1-9]") |     # states 01-09
+         str_starts(GEOID, "[1-4][0-9]") | # states 10-49
+         str_starts(GEOID, "5[0-6]"))       # states 50-56 (excl 57+)
+```
+
+```{r}
+#just to check
+master %>%
+  st_drop_geometry() %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing)) %>%
+  print(n = 30)
+```
+
+```{r}
+master_clean <- master %>%
+  # fix -999 sentinel values across all numeric columns
+  mutate(across(where(is.numeric), ~na_if(., -999))) %>%
+  mutate(across(where(is.numeric), ~na_if(., -2997))) %>%
+  mutate(across(where(is.numeric), ~na_if(., -3996))) %>%
+  # fix NaN in life expectancy
+  mutate(life_exp_weighted = ifelse(is.nan(life_exp_weighted), 
+                                    NA, life_exp_weighted)) %>%
+  # drop redundant and unnecessary columns
+  select(
+    GEOID,
+    name          = NAME.x,
+    geometry,
+    # ACS variables
+    tot_pop, white, black, asian, hispanic,
+    medhhinc, hu_ownocc, tot_hu,
+    pop_povstat, divorced,
+    # prison variables
+    num_prisons, num_open, num_closed,
+    capacity_total, capacity_open, capacity_closed,
+    # outcome variables
+    overdose_rate, suicide_rate, homicide_rate,
+    # controls
+    unemp_rate, RUCC_2013, rural,
+    # life expectancy
+    life_exp_weighted,
+    # correctional employment
+    corr_employ_cat, correctional_emplvl
+  )
+```
+
+```{r}
+glimpse(master_clean)
+
+# confirm -999 is gone
+master_clean %>%
+  st_drop_geometry() %>%
+  summarise(across(where(is.numeric), ~sum(. == -999, na.rm = TRUE))) %>%
+  pivot_longer(everything()) %>%
+  filter(value > 0)
+```
+
+```{r}
+master_clean <- master_clean %>%
+  # replace NA with 0 for prison count variables
+  # (NA means no prison in county, which is genuinely 0)
+  mutate(
+    num_prisons  = replace_na(num_prisons, 0),
+    num_open     = replace_na(num_open, 0),
+    num_closed   = replace_na(num_closed, 0)
+  ) %>%
+  # binary prison presence indicator
+  mutate(
+    prison_present = as.integer(num_open > 0)
+  ) %>%
+  # race/ethnicity as share of total population
+  mutate(
+    pct_white    = white    / tot_pop,
+    pct_black    = black    / tot_pop,
+    pct_asian    = asian    / tot_pop,
+    pct_hispanic = hispanic / tot_pop
+  ) %>%
+  # other proportions
+  mutate(
+    pct_poverty     = pop_povstat / tot_pop,
+    homeown_rate    = hu_ownocc   / tot_hu,
+    divorce_rate    = divorced    / tot_pop
+  ) %>%
+  # population density would need area — do you have that?
+  # log transform population for controls (highly skewed)
+  mutate(
+    log_pop      = log(tot_pop),
+    log_medhhinc = log(medhhinc)
+  )
+
+master_nys <- master_nys %>%
+  mutate(
+    dv_female_rate = (`Agg Assault_female_intimate_partner` + `Simple Assault_female_intimate_partner` +
+                       `Sex Offense_female_intimate_partner` + `Violate Protection Order_female_intimate_partner`) / tot_pop * 100000,
+    dv_male_rate   = (`Agg Assault_male_intimate_partner` + `Simple Assault_male_intimate_partner` +
+                       `Sex Offense_male_intimate_partner` + `Violate Protection Order_male_intimate_partner`) / tot_pop * 100000,
+    prison_present = as.integer(num_open > 0)
+  )
+```
+
+```{r}
+master_nys <- master_nys %>%
+  select(-starts_with("NA_"))
+```
+
+```{r}
+master_nys <- master_nys %>%
+  mutate(
+    # Custody-related outcomes, per 100k county population
+    deaths_in_custody_rate   = n_deaths / tot_pop * 100000,
+    suicides_in_custody_rate = n_suicides / tot_pop * 100000,
+
+    # Domestic violence, per 100k population
+    dv_total_rate = (Total_female_intimate_partner + Total_male_intimate_partner + Total_other_family_victim) / tot_pop * 100000,
+    dv_agg_assault_rate = (`Agg Assault_female_intimate_partner` + `Agg Assault_male_intimate_partner` + `Agg Assault_other_family_victim`) / tot_pop * 100000,
+    dv_sex_offense_rate = (`Sex Offense_female_intimate_partner` + `Sex Offense_male_intimate_partner` + `Sex Offense_other_family_victim`) / tot_pop * 100000,
+
+    # Correctional employment, per 100k population (only meaningful where reported, not suppressed)
+    correctional_emplvl_rate = correctional_emplvl / tot_pop * 100000,
+
+    # Prison staffing gap, as % understaffed relative to budget
+    staffing_gap_pct = (budgeted_fill - actual_fill) / budgeted_fill,
+
+    # Economic/demographic percentages
+    poverty_rate     = pop_poverty / pop_poverty_universe,
+    unemp_rate        = unemployed / labor_force,
+    pct_white         = white / tot_pop,
+    pct_black         = black / tot_pop,
+    pct_asian         = asian / tot_pop,
+    pct_hispanic      = hispanic / tot_pop,
+    homeown_rate      = hu_ownocc / tot_hu,
+    pct_bachelors_plus = edu_bachelors_plus / edu_total,
+    pct_hs_or_less     = edu_hs_or_less / edu_total,
+    divorce_rate       = divorced / tot_pop,
+    rent_burdened_30plus_rate = (rent_burden_30_35 + rent_burden_35_40 + rent_burden_40_50 + rent_burden_50plus) / rent_total,
+    single_parent_rate = (single_dad_children + single_mom_children) / tot_hu   # or divide by tot_pop, depending on definition you want
+
+  )
+```
+
+```{r}
+master_nys %>% filter(suicide_rate < 0) %>% select(GEOID, year, suicide_rate, homicide_rate) %>% distinct()
+
+# Check the raw source before your rate calculation for suspicious sentinel values
+injury_overdose_violence_nys %>% filter(suicide_rate < 0 | homicide_rate < 0)
+```
+
+```{r}
+master_nys <- master_nys %>%
+  select(-homicide_rate, -suicide_rate, -overdose_rate) %>%
+  left_join(
+    injury_overdose_violence_nys %>% 
+      mutate(year = as.numeric(year)) %>%
+      select(GEOID, year, homicide_rate, suicide_rate, overdose_rate),
+    by = c("GEOID", "year")
+  )
+
+nrow(master_nys)   # should still be 310
+sum(is.na(master_nys$suicide_rate))
+sum(is.na(master_nys$homicide_rate))
+
+
+injury_overdose_violence_nys <- injury_overdose_violence_nys %>%
+  mutate(
+    suicide_rate  = ifelse(suicide_rate  == -999, NA, suicide_rate),
+    homicide_rate = ifelse(homicide_rate == -999, NA, homicide_rate),
+    overdose_rate = ifelse(overdose_rate == -999, NA, overdose_rate)
+  )
+
+# Re-join into master_nys (this will overwrite the corrupted columns with clean NA-flagged versions)
+master_nys <- master_nys %>%
+  select(-homicide_rate, -suicide_rate, -overdose_rate) %>%
+  left_join(
+    injury_overdose_violence_nys %>% select(GEOID, year, homicide_rate, suicide_rate, overdose_rate),
+    by = c("GEOID", "year")
+  )
+
+nrow(master_nys)   # should still be 310
+```
+
+```{r}
+range(master_nys$suicide_rate, na.rm = TRUE)
+range(master_nys$homicide_rate, na.rm = TRUE)
+```
+
+
+
+##Analysis
+
+```{r}
+names(master_nys)
+```
+
+```{r}
+table(master_nys$prison_present)
+```
+
+```{r}
+library(gt)
+packageVersion("gt")
+
+vars_to_test <- c(
+  dv_total_rate = "DV Rate (Total)",
+  dv_female_rate = "DV Rate (Female victims)",
+  dv_male_rate = "DV Rate (Male victims)",
+  dv_agg_assault_rate = "DV Rate (Agg. Assault)",
+  dv_sex_offense_rate = "DV Rate (Sex Offense)",
+  suicide_rate = "Suicide Rate (community)",
+  overdose_rate = "Overdose Rate",
+  homicide_rate = "Homicide Rate",
+  life_exp_weighted = "Life Expectancy",
+  divorce_rate = "Divorce Rate",
+  medhhinc = "Median HH Income",
+  poverty_rate = "Poverty Rate",
+  unemp_rate = "Unemployment Rate",
+  homeown_rate = "Homeownership Rate",
+  pct_bachelors_plus = "% Bachelor's+",
+  single_parent_rate = "Single-Parent Rate"
+)
+
+results <- lapply(names(vars_to_test), function(v) {
+  d <- master_nys %>% filter(!is.na(.data[[v]]), !is.na(prison_present))
+  t_result <- t.test(d[[v]] ~ d$prison_present)
+  
+  tibble(
+    variable = vars_to_test[[v]],
+    mean_no_prison = t_result$estimate[1],
+    mean_prison = t_result$estimate[2],
+    difference = t_result$estimate[2] - t_result$estimate[1],
+    p_value = t_result$p.value
+  )
+}) %>% bind_rows()
+
+results %>%
+  gt() %>%
+  cols_label(
+    variable = "Variable",
+    mean_no_prison = "No Prison",
+    mean_prison = "Prison Present",
+    difference = "Difference",
+    p_value = "p-value"
+  ) %>%
+  fmt_number(columns = c(mean_no_prison, mean_prison, difference), decimals = 3) %>%
+  fmt_number(columns = p_value, decimals = 4) %>%
+  tab_header(
+    title = "NY County Outcomes by Prison Presence",
+    subtitle = "Two-sample t-tests, county-year observations, 2019-2024"
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "#fff3cd"),
+    locations = cells_body(rows = p_value < 0.05)
+  ) %>%
+  tab_footnote(
+    footnote = "County-year panel; standard errors do not account for repeated observations per county over time.",
+    locations = cells_column_labels(columns = p_value)
+  )
+```
+
+```{r}
+master_nys %>%
+  group_by(prison_present) %>%
+  summarise(mean_rucc = mean(RUCC_2023, na.rm = TRUE), mean_pop = mean(tot_pop, na.rm = TRUE))
+```
+
+```{r}
+nyc_geoids <- c("36005", "36047", "36061", "36081", "36085")  # Bronx, Kings, New York, Queens, Richmond
+
+master_nys_no_nyc <- master_nys %>%
+  filter(!GEOID %in% nyc_geoids)
+
+nrow(master_nys_no_nyc)   # should be 310 - (5 counties x 5 years) = 285
+table(master_nys_no_nyc$prison_present)
+```
+
+```{r}
+results_no_nyc <- lapply(names(vars_to_test), function(v) {
+  d <- master_nys_no_nyc %>% filter(!is.na(.data[[v]]), !is.na(prison_present))
+  t_result <- t.test(d[[v]] ~ d$prison_present)
+  
+  tibble(
+    variable = vars_to_test[[v]],
+    mean_no_prison = t_result$estimate[1],
+    mean_prison = t_result$estimate[2],
+    difference = t_result$estimate[2] - t_result$estimate[1],
+    p_value = t_result$p.value
+  )
+}) %>% bind_rows()
+
+results_no_nyc %>%
+  gt() %>%
+  cols_label(
+    variable = "Variable",
+    mean_no_prison = "No Prison",
+    mean_prison = "Prison Present",
+    difference = "Difference",
+    p_value = "p-value"
+  ) %>%
+  fmt_number(columns = c(mean_no_prison, mean_prison, difference), decimals = 3) %>%
+  fmt_number(columns = p_value, decimals = 4) %>%
+  tab_header(
+    title = "NY County Outcomes by Prison Presence (Excluding NYC)",
+    subtitle = "Two-sample t-tests, county-year observations, 2019-2024"
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "#fff3cd"),
+    locations = cells_body(rows = p_value < 0.05)
+  )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+#workers compensation data
+workers_compensation <- read_delim("data/workers_comp.csv", delim = "|")
+
+#staffing levels data (DOCCS correctional facilities)
+staffing_levels <- read_delim("data/staffing_levels.csv", delim = "|")
+
+#suicides data
+suicides <- read_delim("data/suicides.csv", delim = "|")
+
+#deaths in custody data
+deaths <- read_delim("data/deaths_in_custody.csv", delim = "|")
+
+#new york state prisons data
+nys_prisons <- read_csv("data/nys_prisons.csv")
+
+
+
+
+#us prison boundaries (from Kaggle)
+prisons_kaggle <- read_csv("data/Prison_Boundaries.csv")
+```
+
+```{r}
+
+#nys_prisons <- tribble(
+#  ~facility, ~hub, ~adjoining, ~security, ~bwc_total, ~bwc_date, ~fixed_cameras, ~install_year, #~capacity, ~staffing_change,
+#  "Adirondack", "Clinton", NA, "Med", 112, "Jun 9, 2025", "Yes", "2018", "74%", "-30%",
+#  "Albion", "Wende", "Orleans", "Med", 224, "Apr 29, 2024", "No", NA, "55%", "-29%",
+#  "Altona", "Clinton", NA, "Med", 104, "Jun 17, 2025", "No", NA, "73%", "-21%",
+#  "Attica", "Wende", "Wyoming", "Max", 344, "Jun 18, 2025", "Yes", "2017", "85%", "-23%",
+#  "Auburn", "Elmira", NA, "Max", 344, "Jul 11, 2025", "Yes", "2023", "67%", "-27%",
+#  "Bedford Hills", "New York City", "Taconic", "Max", 248, "Nov 6, 2023", "Yes", "2019", "76%", #"-25%",
+#  "Cape Vincent", "Watertown", NA, "Med", 136, "Sep 24, 2024", "No", NA, "71%", "-31%",
+#  "Cayuga", "Elmira", NA, "Med", 176, "Oct 23, 2024", "No", NA, "84%", "-40%",
+#  "Clinton", "Clinton", NA, "Max", 400, "May 27, 2025", "Yes", "2018", "79%", "-22%",
+#  "Collins", "Wende", NA, "Med", 256, "Jul 6, 2023", "No", NA, "55%", "-38%",
+#  "Coxsackie", "Great Meadow", "Greene", "Max", 256, "Jun 20, 2025", "Yes", "2022", "83%", #"-32%",
+#  "Eastern", "Sullivan", "Ulster", "Max", 272, "Jul 3, 2024", "No", NA, "89%", "-25%",
+#  "Edgecombe", "New York City", NA, "Min", 64, NA, "No", NA, "44%", "-24%",
+#  "Elmira", "Elmira", NA, "Max", 344, "Jun 26, 2025", "No", NA, "87%", "-22%",
+#  "Fishkill", "Green Haven", NA, "Med", 464, "Mar 20, 2024", "No", NA, "80%", "-16%",
+#  "Five Points", "Elmira", NA, "Max", 280, "Jun 23, 2025", "Yes", "2017", "90%", "-34%"
+#)
+
+
+#nys_prisons <- nys_prisons %>%
+#  mutate(
+#    capacity = parse_number(capacity) / 100,
+#    staffing_change = parse_number(staffing_change) / 100
+#  )
+
+#the code to write out the dataset
+#write_csv(nys_prisons, "data/nys_prisons.csv")
+
+```
+
+
+```{r}
+#nys domestic violence data (2012-2024)
+
+#2024
+nys_violence_2024_raw <- read_excel("data/nys_violence_2024.xlsx")
+
+nys_violence_2024 <- nys_violence_2024_raw %>%
+  rename(
+    county = 1,
+    offense_type = 2,
+    female_intimate_partner = 3,
+    male_intimate_partner = 4,
+    total_intimate_partner = 5,
+    other_family_victim = 6,
+    total_all_victims = 7
+  ) %>%
+  mutate(across(c(female_intimate_partner:total_all_victims), as.numeric))
+
+nys_violence_2024 <- nys_violence_2024 %>%
+  fill(county)  
+
+nys_violence_2024 <- nys_violence_2024 %>%
+  pivot_longer(
+    cols = c(female_intimate_partner, male_intimate_partner, other_family_victim),
+    names_to = "victim_type",
+    values_to = "count"
+  )
+
+nys_violence_2024 <- nys_violence_2024 %>%
+  filter(!is.na(county), !county %in% c("DOMESTIC VIOLENCE VICTIMS REPORTED IN 2024", "NON-NEW YORK CITY COUNTIES"))
+
+nys_violence_2024 <- nys_violence_2024 %>%
+  mutate(year = 2024)
+
+nys_violence_2024 <- nys_violence_2024 %>%
+  slice(1:(n() - 24))
+
+```
+
+```{r}
+#2023
+nys_violence_2023_raw <- read_excel("data/nys_violence_2023.xls")
+
+nys_violence_2023 <- nys_violence_2023_raw %>%
+  rename(
+    county = 1,
+    offense_type = 2,
+    female_intimate_partner = 3,
+    male_intimate_partner = 4,
+    total_intimate_partner = 5,
+    other_family_victim = 6,
+    total_all_victims = 7
+  ) %>%
+  mutate(across(c(female_intimate_partner:total_all_victims), as.numeric))
+
+nys_violence_2023 <- nys_violence_2023 %>%
+  fill(county)  
+
+nys_violence_2023 <- nys_violence_2023 %>%
+  pivot_longer(
+    cols = c(female_intimate_partner, male_intimate_partner, other_family_victim),
+    names_to = "victim_type",
+    values_to = "count"
+  )
+
+nys_violence_2023 <- nys_violence_2023 %>%
+  filter(!is.na(county), !county %in% c("DOMESTIC VIOLENCE VICTIMS REPORTED IN 2023", "NON-NEW YORK CITY COUNTIES"))
+
+nys_violence_2023 <- nys_violence_2023 %>%
+  mutate(year = 2023)
+
+nys_violence_2023 <- nys_violence_2023 %>%
+  slice(1:(n() - 21))
+
+```
+
+
+```{r}
+#2022
+nys_violence_2022_raw <- read_excel("data/nys_violence_2022.xls")
+
+nys_violence_2022 <- nys_violence_2022_raw %>%
+  rename(
+    county = 1,
+    offense_type = 2,
+    female_intimate_partner = 3,
+    male_intimate_partner = 4,
+    total_intimate_partner = 5,
+    other_family_victim = 6,
+    total_all_victims = 7
+  ) %>%
+  mutate(across(c(female_intimate_partner:total_all_victims), as.numeric))
+
+nys_violence_2022 <- nys_violence_2022 %>%
+  fill(county)  
+
+nys_violence_2022 <- nys_violence_2022 %>%
+  pivot_longer(
+    cols = c(female_intimate_partner, male_intimate_partner, other_family_victim),
+    names_to = "victim_type",
+    values_to = "count"
+  )
+
+nys_violence_2022 <- nys_violence_2022 %>%
+  filter(!is.na(county), !county %in% c("DOMESTIC VIOLENCE VICTIMS REPORTED IN 2022", "NON-NEW YORK CITY COUNTIES"))
+
+nys_violence_2022 <- nys_violence_2022 %>%
+  mutate(year = 2022)
+
+nys_violence_2022 <- nys_violence_2022 %>%
+  slice(1:(n() - 21))
+```
+
+```{r}
+#2021
+nys_violence_2021_raw <- read_excel("data/nys_violence_2021.xls")
+
+nys_violence_2021 <- nys_violence_2021_raw %>%
+  rename(
+    county = 1,
+    offense_type = 2,
+    female_intimate_partner = 3,
+    male_intimate_partner = 4,
+    total_intimate_partner = 5,
+    other_family_victim = 6,
+    total_all_victims = 7
+  ) %>%
+  mutate(across(c(female_intimate_partner:total_all_victims), as.numeric))
+
+nys_violence_2021 <- nys_violence_2021 %>%
+  fill(county)  
+
+nys_violence_2021 <- nys_violence_2021 %>%
+  pivot_longer(
+    cols = c(female_intimate_partner, male_intimate_partner, other_family_victim),
+    names_to = "victim_type",
+    values_to = "count"
+  )
+
+nys_violence_2021 <- nys_violence_2021 %>%
+  filter(!is.na(county), !county %in% c("DOMESTIC VIOLENCE VICTIMS REPORTED IN 2021", "NON-NEW YORK CITY COUNTIES"))
+
+nys_violence_2021 <- nys_violence_2021 %>%
+  mutate(year = 2021)
+
+nys_violence_2021 <- nys_violence_2021 %>%
+  slice(1:(n() - 21))
+```
+
+```{r}
+#2020
+nys_violence_2020_raw <- read_excel("data/nys_violence_2020.xls")
+
+nys_violence_2020 <- nys_violence_2020_raw %>%
+  rename(
+    county = 1,
+    offense_type = 2,
+    female_intimate_partner = 3,
+    male_intimate_partner = 4,
+    total_intimate_partner = 5,
+    other_family_victim = 6,
+    total_all_victims = 7
+  ) %>%
+  mutate(across(c(female_intimate_partner:total_all_victims), as.numeric))
+
+nys_violence_2020 <- nys_violence_2020 %>%
+  fill(county)  
+
+nys_violence_2020 <- nys_violence_2020 %>%
+  pivot_longer(
+    cols = c(female_intimate_partner, male_intimate_partner, other_family_victim),
+    names_to = "victim_type",
+    values_to = "count"
+  )
+
+nys_violence_2020 <- nys_violence_2020 %>%
+  filter(!is.na(county), !county %in% c("DOMESTIC VIOLENCE VICTIMS REPORTED IN 2020", "NON-NEW YORK CITY COUNTIES"))
+
+nys_violence_2020 <- nys_violence_2020 %>%
+  mutate(year = 2020)
+
+nys_violence_2020 <- nys_violence_2020 %>%
+  slice(1:(n() - 21))
+```
+
+
+```{r}
+#2019
+nys_violence_2019_raw <- read_excel("data/nys_violence_2019.xls")
+
+nys_violence_2019 <- nys_violence_2019_raw %>%
+  rename(
+    county = 1,
+    offense_type = 2,
+    female_intimate_partner = 3,
+    male_intimate_partner = 4,
+    total_intimate_partner = 5,
+    other_family_victim = 6,
+    total_all_victims = 7
+  ) %>%
+  mutate(across(c(female_intimate_partner:total_all_victims), as.numeric))
+
+nys_violence_2019 <- nys_violence_2019 %>%
+  fill(county)  
+
+nys_violence_2019 <- nys_violence_2019 %>%
+  pivot_longer(
+    cols = c(female_intimate_partner, male_intimate_partner, other_family_victim),
+    names_to = "victim_type",
+    values_to = "count"
+  )
+
+nys_violence_2019 <- nys_violence_2019 %>%
+  filter(!is.na(county), !county %in% c("DOMESTIC VIOLENCE VICTIMS REPORTED IN 2019", "NON-NEW YORK CITY COUNTIES"))
+
+nys_violence_2019 <- nys_violence_2019 %>%
+  mutate(year = 2019)
+
+nys_violence_2019 <- nys_violence_2019 %>%
+  slice(1:(n() - 21))
+```
+
+```{r}
+# save with geometry for mapping
+st_write(master_clean, "data/master_clean.geojson", delete_dsn = TRUE)
+
+# save without geometry for modeling/EDA
+master_clean %>%
+  st_drop_geometry() %>%
+  write_csv("data/master_clean.csv")
+```

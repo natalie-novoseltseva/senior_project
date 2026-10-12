@@ -1,0 +1,733 @@
+---
+title: "PUMA dataset, 2024 (earlier version)"
+subtitle: "Outcomes, controls and centroid-based prison measures for 2020 PUMAs"
+author: "Natalie Novoseltseva"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    code-tools: true
+editor:
+  markdown:
+    wrap: 72
+---
+
+# About this qmd {.unnumbered}
+
+This is the first version of the PUMA dataset, built around 2024
+overdose deaths and the 2020–2024 ACS 5-year sample. The main analysis
+now uses the 2022–2024 dataset. It also keeps the earlier exploratory
+work on exposure measures (inverse-distance weighting with K nearest
+prisons or a fixed radius, including versions where K or the radius was
+chosen by best fit). Those fit-selected measures aren't used in the main
+analysis.
+
+Data:
+
+-   IPUMS USA, 2020–2024 ACS 5-year sample (`us2024c`): controls and
+    divorce outcomes, with people in institutions (including prisoners)
+    removed. Every respondent in this sample is coded to a 2020 PUMA.
+-   2020 decennial census tract populations: weights for turning tract
+    values (CDC rates, RUCA codes) into PUMA values.
+-   CDC tract-level death rates for 2024 (overdose, suicide, homicide).
+-   USDA RUCA codes (2020 tracts) and HIFLD/ICPSR prison boundaries.
+
+The slow downloads (IPUMS extract, tract populations) happen only the
+first time; after that the saved files are read. The first run needs an
+IPUMS API key and a Census API key.
+
+Outputs: `data/final/national_puma_dataset.csv` and
+`data/final/rural_puma_dataset.csv`. Read `GEOID20` and `state_fips`
+back as text so the leading zeros survive.
+
+Units: shares are percentages (0–100). Exceptions are death rates (per
+100,000), distances (km), land area (km²), density (people per km²),
+median income (2024 dollars), counts, logs, and the inverse-distance
+measures (sum of 1/(km + 1), no natural unit).
+
+# Setup {#sec-setup}
+
+```{r}
+#| label: setup
+library(tidyverse)   
+library(sf)          
+library(tidycensus)  
+library(tigris)     
+library(nngeo)       
+library(gt)          
+library(broom)       
+library(fixest)      
+library(ipumsr)      
+
+options(tigris_use_cache = TRUE)  # cache downloaded shapefiles between sessions
+```
+
+# Building the dataset {#sec-build}
+
+## IPUMS ACS microdata (2020–2024 5-year)
+
+The first run requests the extract from IPUMS and saves the microdata as
+`data/raw/data_ipums_2024.csv` and the codebook as `data/ddi.rds`. After
+that it just reads the saved files.
+
+```{r}
+#| label: ipums-extract
+# Download the extract the first time and save it; after that, read the saved files.
+# Delete the two saved files to request a new extract (e.g. after adding variables).
+ipums_csv <- "data/raw/data_ipums_2024.csv"
+ipums_ddi <- "data/ddi.rds"
+
+if (!file.exists(ipums_csv)) {
+  extract_def <- define_extract_micro(
+    collection  = "usa",
+    description = "Non-institutionalized population by 2020 PUMA, 2020-2024 ACS 5-year",
+    samples     = "us2024c",   # 2020-2024 ACS 5-year; all records coded to 2020 PUMAs
+    variables   = c(
+      "STATEFIP", "PUMA",                # geography: state + 2020 PUMA
+      "PERWT", "HHWT", "PERNUM",         # person weight, household weight, person number in household
+      "GQTYPE",                          # group-quarters type (to drop institutions, incl. prisons)
+      "AGE", "RACE", "HISPAN",           # demographics
+      "MARST", "DIVINYR",                # marital status, divorced in past 12 months
+      "EDUC",                            # educational attainment
+      "POVERTY",                         # family income as % of poverty line
+      "EMPSTAT",                         # employed / unemployed / not in labor force
+      "HHINCOME"                         # total household income (2024 dollars in this sample)
+    )
+  )
+
+  extract_submitted <- submit_extract(extract_def)
+  extract_complete  <- wait_for_extract(extract_submitted)
+  path <- download_extract(extract_complete, download_dir = "data")
+
+  ddi <- read_ipums_ddi(path)                  # codebook (variable labels, value labels)
+  data_ipums_2024 <- read_ipums_micro(ddi)     # one row per person (roughly 16 million rows)
+
+  write_csv(data_ipums_2024, ipums_csv)
+  saveRDS(ddi, ipums_ddi)
+}
+
+# The CSV keeps the numeric codes but not the labels, so the labels come from ddi
+data_ipums_2024 <- read_csv(ipums_csv)
+ddi <- readRDS(ipums_ddi)
+```
+
+### Codes and the institutional population
+
+The public ACS doesn't separate prisons from other institutions, so
+nursing-home residents are dropped along with prisoners.
+
+```{r}
+#| label: ipums-codes
+# Labels come from the codebook (ddi, loaded above), since the CSV has codes only.
+ipums_val_labels(ddi, GQTYPE)    # 1-4 = institutions (prisons, nursing homes, etc.)
+ipums_val_labels(ddi, MARST)     # 1-3 = married/separated, 4 = divorced
+ipums_val_labels(ddi, DIVINYR)   # 1 = No, 2 = Yes, 0/8 = outside universe / suppressed
+ipums_val_labels(ddi, EMPSTAT)   # 1 = employed, 2 = unemployed, 3 = not in labor force
+ipums_val_labels(ddi, EDUC)      # 10 = 4 years of college, 11 = 5+ years
+ipums_val_labels(ddi, RACE)      # 1 = White
+ipums_val_labels(ddi, HISPAN)    # 0 = Not Hispanic, 9 = Not reported
+
+# Remove everyone living in an institution. The public ACS doesn't separate prisons
+# from other institutions, so nursing-home residents are removed too. 
+data_noninst <- data_ipums_2024 %>%
+  filter(!GQTYPE %in% c(1, 2, 3, 4))
+
+# 7-digit PUMA ID (2-digit state + 5-digit PUMA), matching GEOID20 in the boundary file
+data_noninst <- data_noninst %>%
+  mutate(puma_geoid = paste0(sprintf("%02d", STATEFIP), sprintf("%05d", PUMA)))
+```
+
+### PUMA-level variables
+
+```{r}
+#| label: ipums-puma
+# Pattern used throughout: sum(PERWT[condition]) is the weighted number of people
+# meeting the condition; dividing two of these and multiplying by 100 gives a percentage.
+# In a 5-year sample the weights add up to the average population over 2020-2024.
+
+# Person-level variables 
+puma_person <- data_noninst %>%
+  group_by(puma_geoid) %>%
+  summarise(
+    # Population (non-institutionalized)
+    total_pop = sum(PERWT),
+
+    # Race: % whose race is not White (Hispanic Whites count as White).  
+    pct_nonwhite    = 100 * (1 - sum(PERWT[RACE == 1]) / sum(PERWT)),
+    # Alternative: % who are not non-Hispanic White (excludes HISPAN "not reported")
+    pct_nonwhite_nh = 100 * (1 - sum(PERWT[RACE == 1 & HISPAN == 0]) / sum(PERWT[HISPAN != 9])),
+
+    # Education: % of people 25+ with a bachelor's degree or more
+    pct_bachelors_plus = 100 * sum(PERWT[EDUC >= 10 & AGE >= 25]) / sum(PERWT[AGE >= 25]),
+
+    # Poverty: % below the poverty line, among people with a poverty status.
+    # POVERTY = 0 means N/A (e.g. college dorms), so it's excluded from both parts.
+    pct_poverty = 100 * sum(PERWT[POVERTY > 0 & POVERTY < 100]) / sum(PERWT[POVERTY > 0]),
+
+    # Unemployment: % of the labor force (employed + unemployed) that is unemployed.
+    # EMPSTAT covers people 16+. Note: members of the armed forces count as employed here.
+    pct_unemployed = 100 * sum(PERWT[EMPSTAT == 2]) / sum(PERWT[EMPSTAT %in% c(1, 2)]),
+
+    # Divorce outcome
+    # Main outcome: % of ever-married people (15+) who divorced in the past 12 months.
+    pct_divorced_past_yr = 100 * sum(PERWT[DIVINYR == 2]) / sum(PERWT[DIVINYR %in% c(1, 2)]),
+    # Alternative: % of people "at risk" of divorce (currently married/separated, or divorced
+    # in the past year). The "|" counts each person once, so a divorce-then-remarriage isn't double-counted.
+    pct_divorced_past_yr_atrisk = 100 * sum(PERWT[DIVINYR == 2]) / sum(PERWT[MARST %in% 1:3 | DIVINYR == 2]),
+    # Stock measure: % of people 15+ currently divorced
+    pct_currently_divorced = 100 * sum(PERWT[MARST == 4 & AGE >= 15]) / sum(PERWT[AGE >= 15]),
+
+    # Unweighted sample sizes, to judge how reliable each PUMA's divorce rate is
+    n_person_sample   = n(),
+    n_divorced_sample = sum(DIVINYR == 2)
+  )
+
+# Median household income (household level)
+# Income is a household property, so use one record per household (PERNUM == 1) and the
+# household weight HHWT. HHINCOME = 9999999 means N/A (people in group quarters).
+# In IPUMS multi-year samples, dollar amounts are already in final-year (2024) dollars.
+weighted_median <- function(x, w) {
+  x <- as.numeric(x); w <- as.numeric(w)
+  o <- order(x)
+  cum_share <- cumsum(w[o]) / sum(w)
+  x[o][which(cum_share >= 0.5)[1]]   # first value at or past half the weight
+}
+
+puma_household <- data_noninst %>%
+  filter(PERNUM == 1, HHINCOME != 9999999) %>%
+  group_by(puma_geoid) %>%
+  summarise(
+    medhhinc   = weighted_median(HHINCOME, HHWT),
+    n_hh_sample = n()
+  )
+
+# Combine and add logged versions used in the models 
+puma_summary <- puma_person %>%        # puma_summary - all ipums vars in the final form
+  left_join(puma_household, by = "puma_geoid") %>%
+  mutate(
+    log_pop      = log(total_pop),
+    log_medhhinc = log(medhhinc)
+  )
+
+nrow(puma_summary)                      # should be 2462 (50 states + DC)
+```
+
+## PUMA boundaries
+
+```{r}
+#| label: puma-geography
+# Download cartographic-boundary PUMA polygons for the 50 states + DC.
+# fips_codes lists states first, so the first 51 unique codes are 50 states + DC
+# (territories such as Puerto Rico come after and are excluded).
+state_fips <- unique(tidycensus::fips_codes$state_code)[1:51]
+
+pumas_2020 <- map_dfr(state_fips, function(st) {
+  pumas(state = st, cb = TRUE, year = 2020)
+})
+
+nrow(pumas_2020)
+names(pumas_2020)   # look for GEOID20
+
+# Start the master PUMA table: boundaries + IPUMS aggregates.
+puma_final <- pumas_2020 %>%.       # puma_final - geography, geoid + ipums variables
+  left_join(puma_summary, by = c("GEOID20" = "puma_geoid"))
+
+nrow(puma_final)                    # should still be 2462
+sum(is.na(puma_final$total_pop))    # PUMAs with no match in your microdata
+```
+
+## Tract populations (2020 census)
+
+The CDC rates and RUCA codes are reported for tracts, and each PUMA is
+made up of whole tracts. To get one PUMA value from many tract values I
+average them weighted by tract population. The 2020 census is used
+because its tract IDs match `rel20` and the RUCA file exactly.
+
+```{r}
+#| label: tract-pop
+# 2020 census tract populations. Downloaded the first time (needs a Census API key for
+# tidycensus) and saved; after that the saved file is read. GEOID is read as text so the
+# leading zeros survive and the IDs match rel20.
+tract_pop_file <- "data/raw/tract_pop_2020.csv"
+if (!file.exists(tract_pop_file)) {
+  tract_pop_2020 <- map_dfr(state_fips, function(st) {
+    get_decennial(
+      geography = "tract", state = st, year = 2020, sumfile = "pl",
+      variables = c(tot_pop          = "P1_001N",   # total population (the weight)
+                    pop_inst_gq      = "P5_002N",   # people in institutional group quarters
+                    pop_correctional = "P5_003N"),  # people in adult correctional facilities
+      output = "wide")
+  }) %>%
+    select(GEOID, tot_pop, pop_inst_gq, pop_correctional)
+  write_csv(tract_pop_2020, tract_pop_file)
+}
+tract_pop_2020 <- read_csv(tract_pop_file, col_types = cols(GEOID = col_character()))
+
+nrow(tract_pop_2020)                    # ~84,000 tracts
+all(nchar(tract_pop_2020$GEOID) == 11)  # every ID should be an 11-digit tract code
+```
+
+## Death rates (CDC, tract level)
+
+```{r}
+#| label: deaths-tract
+# CDC death rates (per 100,000) for drug overdose, suicide, homicide and firearm
+# injuries, by census tract of residence, for several periods. Only 2024 is kept below.
+injury_overdose_violence <- read_csv("data/raw/injury_overdose_violence_census_tract.csv")
+
+# Small tracts are pooled in the source file: NAME holds a comma-separated list of
+# the tracts sharing one rate. separate_rows() gives each real tract its own row,
+# each carrying the pooled rate.
+injury_overdose_violence_exploded <- injury_overdose_violence %>%
+  separate_rows(NAME, sep = ",\\s*") %>% #split combined tract lists into one row per real tract
+  rename(real_tract_geoid = NAME) %>%
+  mutate(real_tract_geoid = str_trim(real_tract_geoid))
+
+# These should now be clean 11-digit real Census tract GEOIDs
+head(injury_overdose_violence_exploded$real_tract_geoid, 10)
+nchar(injury_overdose_violence_exploded$real_tract_geoid[1])
+
+# 2024 only, three intents, reshaped wide: one row per tract, one column per rate.
+# -999 marks suppressed values and is converted to NA.
+injury_overdose_violence_2024 <- injury_overdose_violence_exploded %>%
+  filter(Period == "2024") %>%
+  filter(Intent %in% c("Drug_OD", "All_Suicide", "All_Homicide")) %>%
+  mutate(Rate = as.numeric(Rate)) %>%
+  pivot_wider(
+    id_cols    = c(real_tract_geoid, ST_GEOID, ST_NAME, Period),
+    names_from  = Intent,
+    values_from = Rate,
+    names_glue  = "{Intent}_rate"
+  ) %>%
+  rename(
+    overdose_rate = Drug_OD_rate,
+    suicide_rate  = All_Suicide_rate,
+    homicide_rate = All_Homicide_rate,
+    GEOID = real_tract_geoid,
+    year = Period
+  ) %>%
+  mutate(
+    year = as.numeric(year),
+    suicide_rate  = ifelse(suicide_rate  == -999, NA, suicide_rate),
+    homicide_rate = ifelse(homicide_rate == -999, NA, homicide_rate),
+    overdose_rate = ifelse(overdose_rate == -999, NA, overdose_rate)
+  )
+
+nrow(injury_overdose_violence_2024)
+n_distinct(injury_overdose_violence_2024$GEOID)   # should equal nrow() if one row per tract
+```
+
+### Tracts to PUMAs
+
+```{r}
+#| label: deaths-puma
+# Tract -> 2020 PUMA crosswalk (official Census relationship file)
+rel20_raw <- read_csv("https://www2.census.gov/geo/docs/maps-data/data/rel2020/2020_Census_Tract_to_2020_PUMA.txt",
+                      col_types = cols(.default = "c"))
+
+# rel20: GEOID = 11-digit tract ID, GEOID20 = 7-digit 2020 PUMA ID.
+# Reused later in the Rurality section.
+rel20 <- rel20_raw %>%
+  transmute(
+    GEOID   = paste0(STATEFP, COUNTYFP, TRACTCE),
+    GEOID20 = paste0(STATEFP, PUMA5CE)
+  )
+
+# Attach PUMA and tract population (weights) to the exploded CDC data 
+# tract_pop_2020 comes from the 2020 decennial census (section "Tract populations").
+tract_outcomes <- injury_overdose_violence_2024 %>%
+  select(GEOID, overdose_rate, suicide_rate, homicide_rate) %>%
+  left_join(rel20, by = "GEOID") %>%
+  left_join(tract_pop_2020 %>% select(GEOID, tot_pop), by = "GEOID")
+
+# Checks before aggregating
+anyDuplicated(tract_outcomes$GEOID)              # 0 => each tract appears once
+mean(!is.na(tract_outcomes$GEOID20))             # share of CDC tracts matched to a PUMA
+mean(!is.na(tract_outcomes$tot_pop))             # share with population weights
+
+# Population-weighted aggregation to PUMA
+# A PUMA's rate = average of its tracts' rates, weighted by tract population.
+# These stay as deaths per 100,000 (the CDC's unit)
+puma_outcomes <- tract_outcomes %>%
+  filter(!is.na(GEOID20), !is.na(tot_pop), tot_pop > 0) %>%
+  group_by(GEOID20) %>%
+  summarise(
+    overdose_rate_puma  = weighted.mean(overdose_rate,  tot_pop, na.rm = TRUE),
+    suicide_rate_puma   = weighted.mean(suicide_rate,   tot_pop, na.rm = TRUE),
+    homicide_rate_puma  = weighted.mean(homicide_rate,  tot_pop, na.rm = TRUE),
+    # Coverage: % of the PUMA's population living in tracts with a non-missing overdose rate
+    pct_pop_with_overdose_data = 100 * sum(tot_pop[!is.na(overdose_rate)]) / sum(tot_pop),
+    n_tracts = n()
+  )
+
+# Join onto your PUMA dataset 
+puma_final <- puma_final %>%
+  left_join(puma_outcomes, by = "GEOID20")
+
+nrow(puma_final)                               # still 2462
+sum(is.na(puma_final$overdose_rate_puma))      # PUMAs with no overdose data at all
+summary(puma_final$pct_pop_with_overdose_data)
+```
+
+## Rurality (RUCA codes)
+
+```{r}
+#| label: ruca
+# Read the RUCA file with every column as text. FIPS codes have leading zeros,
+# and reading them as numbers would strip the zero.
+ruca_raw <- read_csv("data/raw/rurality/RUCA-codes-2020-tract.csv", col_types = cols(.default = "c"))
+
+# Each tract's 2020 ID and its primary RUCA code (1-10, or 99 for "not coded").
+ruca <- ruca_raw %>%
+  transmute(GEOID = TractFIPS20, ruca = as.numeric(PrimaryRUCA))
+
+# Every tract with its population, its PUMA, and its RUCA code. 
+# Weights are total 2020 census population, which includes people in prisons.
+tract_ruca <- tract_pop_2020 %>%
+  select(GEOID, tot_pop) %>%
+  left_join(rel20, by = "GEOID") %>%
+  left_join(ruca,  by = "GEOID")
+
+# Share of tracts that found a PUMA and a RUCA code
+mean(!is.na(tract_ruca$GEOID20))
+mean(!is.na(tract_ruca$ruca))
+
+puma_rural_ruca <- tract_ruca %>%
+  # Drop tracts with no PUMA, no RUCA code, the "not coded" category (99), or zero population
+  filter(!is.na(GEOID20), !is.na(ruca), ruca != 99, tot_pop > 0) %>%
+  group_by(GEOID20) %>%
+  summarise(
+    # % of the PUMA's population living in each type of tract
+    pct_pop_metro      = 100 * sum(tot_pop[ruca %in% 1:3]) / sum(tot_pop),  # metropolitan
+    pct_pop_micro      = 100 * sum(tot_pop[ruca %in% 4:6]) / sum(tot_pop),  # micropolitan
+    pct_pop_small_town = 100 * sum(tot_pop[ruca %in% 7:9]) / sum(tot_pop),  # small town
+    pct_pop_rural      = 100 * sum(tot_pop[ruca == 10])     / sum(tot_pop)   # rural  
+  )
+
+puma_final <- puma_final %>%
+  left_join(puma_rural_ruca, by = "GEOID20")
+
+nrow(puma_final)                         # should still be 2462
+sum(is.na(puma_final$pct_pop_rural))     # PUMAs without a rurality value
+summary(puma_final$pct_pop_rural)
+```
+
+## Analysis dataset
+
+```{r}
+#| label: puma-df
+# puma_final already holds everything (IPUMS, deaths, rurality); drop the geometry
+# and add helper columns.
+puma_df <- puma_final %>%
+  st_drop_geometry() %>%
+  mutate(
+    pct_pop_nonmetro = 100 - pct_pop_metro,   # used to define the rural subsample
+    state_fips       = substr(GEOID20, 1, 2), # used to cluster standard errors
+
+    # Area: ALAND20 is the official land area in square meters (water excluded)
+    land_area_km2    = as.numeric(ALAND20) / 1e6,
+
+    # Population density: non-institutionalized residents (IPUMS) per km2 of land
+    pop_density      = total_pop / land_area_km2,
+    log_pop_density  = log(pop_density)       # density is very skewed; use the log in models
+  )
+
+nrow(puma_df)                             # should be 2462
+```
+
+Share of each PUMA's land area (rather than population) in non-metro
+tracts, used for the alternative rural definitions.
+
+```{r}
+#| label: rural-area
+# % of each PUMA's land area in non-metro tracts, and three rural flags
+tract_land <- map_dfr(state_fips, ~ tracts(state = .x, year = 2020, cb = TRUE)) %>%
+  st_drop_geometry() %>%
+  transmute(GEOID, aland_km2 = ALAND / 1e6)      # land area, excluding water
+
+puma_rural_area <- tract_ruca %>%
+  filter(!is.na(GEOID20), !is.na(ruca), ruca != 99) %>%
+  left_join(tract_land, by = "GEOID") %>%
+  filter(!is.na(aland_km2), aland_km2 > 0) %>%
+  group_by(GEOID20) %>%
+  summarise(pct_area_nonmetro = 100 * sum(aland_km2[ruca >= 4]) / sum(aland_km2),
+            .groups = "drop")
+
+puma_df <- puma_df %>%
+  left_join(puma_rural_area, by = "GEOID20") %>%
+  mutate(rural_pop   = pct_pop_nonmetro  > 50,
+         rural_area  = pct_area_nonmetro > 50,
+         rural_both  = rural_pop & rural_area)
+
+table(pop = puma_df$rural_pop, area = puma_df$rural_area, useNA = "ifany")
+```
+
+## Prison exposure
+
+All measures use open state and federal prisons only, with distances
+from each PUMA's geographic centroid.
+
+| Measure | How it's built |
+|----|----|
+| `prison_present`, `num_prisons` | prisons inside the PUMA boundary |
+| `dist_to_nearest_prison_km` | centroid to the closest prison |
+| `num_prisons_within_5km`, `_10km` | prisons within 5 / 10 km of the centroid |
+| IDW | sum of 1/(km + 1) over a set of prisons (0 km → 1.0, 4 km → 0.2, 49 km → 0.02) |
+| IDW, K nearest | the K nearest prisons: K = 5, or K chosen by best fit |
+| IDW, radius | every prison within R km: R = 50 and 10, or R chosen by best fit |
+
+"Chosen by best fit" - the one with the lowest AIC.
+
+### Counts, nearest distance, fixed-K IDW
+
+```{r}
+#| label: prison-exposure
+# PUMA polygons and centroids in a meters-based CRS (EPSG:5070, CONUS Albers)
+pumas_proj     <- st_transform(pumas_2020, 5070)
+puma_centroids <- st_centroid(pumas_proj)
+
+# Prisons: OPEN STATE and FEDERAL facilities only, as points 
+# Every measure below uses this set and nothing else.
+prisons_icpsr <- st_read("data/raw/prison-boundaries-1-geojson.geojson") %>%
+  st_make_valid()
+
+prisons_open_pts <- prisons_icpsr %>%
+  filter(STATUS == "OPEN", TYPE %in% c("STATE", "FEDERAL")) %>%
+  st_centroid() %>%
+  st_transform(5070)
+
+nrow(prisons_open_pts)          # should be 2005
+table(prisons_open_pts$TYPE)
+
+# Number of prisons inside each PUMA, and presence (0/1) 
+prisons_by_puma <- st_join(prisons_open_pts, pumas_proj["GEOID20"], join = st_within) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(GEOID20)) %>%
+  count(GEOID20, name = "num_prisons")
+
+# Distances from each PUMA centroid to its 20 nearest prisons 
+# Computed once and reused for the nearest-distance and both IDW measures.
+# st_nn() returns them sorted from nearest to farthest, in meters.
+K_max <- 20
+nn <- st_nn(puma_centroids, prisons_open_pts, k = K_max, returnDist = TRUE, progress = FALSE)
+dist_km <- lapply(nn$dist, function(d) d / 1000)   # list: one vector of 20 distances (km) per PUMA
+
+# Distance to the nearest prison (km)
+puma_centroids$dist_to_nearest_prison_km <- sapply(dist_km, function(d) d[1])
+
+# Number of prisons within 5 km and 10 km of the centroid 
+puma_centroids$num_prisons_within_5km  <- lengths(st_is_within_distance(puma_centroids, prisons_open_pts, dist = 5000))
+puma_centroids$num_prisons_within_10km <- lengths(st_is_within_distance(puma_centroids, prisons_open_pts, dist = 10000))
+
+# Inverse-distance-weighted exposure, fixed K (K_fixed below)
+# Sum of 1 / (km + 1) over the K nearest prisons; closer prisons count more.
+idw <- function(K) sapply(dist_km, function(d) sum(1 / (d[1:K] + 1)))
+idw_for_K <- function(K) tibble(GEOID20 = puma_centroids$GEOID20, idw_k = idw(K))
+
+K_fixed <- 5
+puma_centroids$prison_exposure_idw <- idw(K_fixed)
+
+# Assemble and add to puma_df
+puma_exposure <- puma_centroids %>%
+  st_drop_geometry() %>%
+  select(GEOID20, dist_to_nearest_prison_km, num_prisons_within_5km,
+         num_prisons_within_10km, prison_exposure_idw) %>%
+  left_join(prisons_by_puma, by = "GEOID20") %>%
+  mutate(
+    num_prisons    = replace_na(num_prisons, 0),     # PUMAs with no prison inside get 0, not NA
+    prison_present = as.integer(num_prisons > 0)
+  )
+
+# Remove any exposure columns already in puma_df (from an earlier run, or from older
+# versions of this chunk) so re-running doesn't create .x / .y duplicates
+old_cols <- c("num_prisons", "prison_present", "capacity_total", "pop_total",
+              "dist_to_nearest_prison_km", "num_prisons_within_5km", "num_prisons_within_10km",
+              "num_prisons_within_25km", "num_prisons_within_50km", "mean_dist_3_nearest_km",
+              "prison_exposure_idw", "prison_exposure_idw_auto_od", "prison_exposure_idw_auto_div")
+
+puma_df <- puma_df %>%
+  select(-any_of(old_cols)) %>%
+  left_join(puma_exposure, by = "GEOID20")
+
+nrow(puma_df)                      # still 2462
+table(puma_df$prison_present)
+summary(puma_df$prison_exposure_idw)
+```
+
+### IDW with K chosen by fit
+
+```{r}
+#| label: prison-idw-auto-k
+# Inverse-distance-weighted exposure, K chosen by the data 
+# For each K from 1 to 20, fit the full model and record its AIC; keep the K with the lowest AIC.
+# Selection uses the national sample; the chosen K is also used for the rural dataset.
+# `controls` must match the control set used in the analysis notebook.
+controls <- "pct_nonwhite + log_medhhinc + pct_poverty + pct_unemployed + pct_pop_rural + pct_bachelors_plus + log_pop"
+
+choose_K <- function(outcome) {
+  fml <- as.formula(paste(outcome, "~ idw_k +", controls))
+  map_dfr(1:K_max, function(K) {
+    d <- puma_df %>% left_join(idw_for_K(K), by = "GEOID20")
+    m <- feols(fml, data = d, cluster = ~state_fips)
+    tibble(K = K, AIC = AIC(m), n = nobs(m))
+  })
+}
+
+k_search_od  <- choose_K("overdose_rate_puma")
+k_search_div <- choose_K("pct_divorced_past_yr")
+
+K_auto_od  <- k_search_od$K[which.min(k_search_od$AIC)]
+K_auto_div <- k_search_div$K[which.min(k_search_div$AIC)]
+K_auto_od; K_auto_div              # the selected K for each outcome
+
+# How fit changes with K (a flat curve means the choice of K hardly matters)
+ggplot(k_search_od, aes(K, AIC)) + geom_line() + geom_point() +
+  labs(title = "Overdose model: AIC by K (lower = better)")
+
+puma_df <- puma_df %>%
+  select(-any_of(c("prison_exposure_idw_auto_od", "prison_exposure_idw_auto_div"))) %>%
+  left_join(idw_for_K(K_auto_od)  %>% rename(prison_exposure_idw_auto_od  = idw_k), by = "GEOID20") %>%
+  left_join(idw_for_K(K_auto_div) %>% rename(prison_exposure_idw_auto_div = idw_k), by = "GEOID20")
+```
+
+Quick checks on whether prison exposure improves fit at all (these are
+exploratory):
+
+```{r}
+#| label: check-aic-no-prison
+# AIC of the divorce model with no prison variable, to compare with the K search
+  AIC(feols(as.formula(paste("pct_divorced_past_yr ~", controls)), data = puma_df, cluster = ~state_fips))
+```
+
+```{r}
+#| label: check-m0-vs-m13
+# Divorce model without vs. with the automatic-K exposure (state-clustered SEs)
+m0  <- feols(as.formula(paste("pct_divorced_past_yr ~", controls)), data = puma_df, cluster = ~state_fips)
+m13 <- feols(as.formula(paste("pct_divorced_past_yr ~ prison_exposure_idw_auto_od +", controls)),
+             data = puma_df, cluster = ~state_fips)
+
+etable(m0, m13, fitstat = ~ r2 + aic + n)   # side by side: coefficients, clustered SEs, R², AIC, N
+```
+
+### IDW within a radius
+
+```{r}
+#| label: prison-idw-radius
+# Distance from every PUMA centroid to every prison (km)
+# Rows = PUMAs (same order as puma_centroids), columns = prisons.
+D_km <- matrix(as.numeric(st_distance(puma_centroids, prisons_open_pts)) / 1000,
+               nrow = nrow(puma_centroids))
+
+# Sum of 1 / (km + 1) over all prisons within R km; PUMAs with none in range get 0.
+idw_radius <- function(R) rowSums((D_km <= R) * (1 / (D_km + 1)))
+idw_for_R  <- function(R) tibble(GEOID20 = puma_centroids$GEOID20, idw_r = idw_radius(R))
+
+# How many prisons each PUMA "sees" at a given radius (this is the K that varies)
+n_within <- function(R) rowSums(D_km <= R)
+summary(n_within(50)); summary(n_within(100))
+
+# Version 1: radius chosen by me
+R_fixed <- 50   # km
+puma_df <- puma_df %>%
+  select(-any_of(c("prison_exposure_idw_r50", "n_prisons_within_r50"))) %>%
+  left_join(idw_for_R(R_fixed) %>% rename(prison_exposure_idw_r50 = idw_r), by = "GEOID20") %>%
+  left_join(tibble(GEOID20 = puma_centroids$GEOID20, n_prisons_within_r50 = n_within(R_fixed)),
+            by = "GEOID20")
+
+# Version 2: radius chosen by the lowest AIC
+R_values <- c(5, 10, 25, 50, 75, 100, 150, 200, 300)
+
+choose_R <- function(outcome) {
+  fml <- as.formula(paste(outcome, "~ idw_r +", controls))
+  map_dfr(R_values, function(R) {
+    d <- puma_df %>% left_join(idw_for_R(R), by = "GEOID20")
+    m <- feols(fml, data = d, cluster = ~state_fips)
+    tibble(R = R, AIC = AIC(m), n = nobs(m))
+  })
+}
+
+r_search_od  <- choose_R("overdose_rate_puma")
+r_search_div <- choose_R("pct_divorced_past_yr")
+
+R_auto_od  <- r_search_od$R[which.min(r_search_od$AIC)]
+R_auto_div <- r_search_div$R[which.min(r_search_div$AIC)]
+R_auto_od; R_auto_div
+
+ggplot(r_search_od, aes(R, AIC)) + geom_line() + geom_point() +
+  labs(title = "Overdose model: AIC by radius (lower = better)", x = "Radius (km)")
+
+puma_df <- puma_df %>%
+  select(-any_of(c("prison_exposure_idw_r_auto_od", "prison_exposure_idw_r_auto_div"))) %>%
+  left_join(idw_for_R(R_auto_od)  %>% rename(prison_exposure_idw_r_auto_od  = idw_r), by = "GEOID20") %>%
+  left_join(idw_for_R(R_auto_div) %>% rename(prison_exposure_idw_r_auto_div = idw_r), by = "GEOID20")
+```
+
+### IDW within 10 km
+
+The 10 km radius fit best for overdose in the radius search above.
+
+```{r}
+#| label: prison-idw-r10
+# Adds prison_exposure_idw_r10 (all prisons within 10 km). 
+r10 <- n_within(10)
+table(r10 > 0)                              # how many PUMAs have any prison within 10 km
+# (r10 is the plain count; the same count is in puma_df as num_prisons_within_10km)
+puma_df <- puma_df %>% 
+  select(-any_of("prison_exposure_idw_r10")) %>%
+  left_join(idw_for_R(10) %>% rename(prison_exposure_idw_r10 = idw_r), by = "GEOID20")
+
+cor(puma_df[, c("prison_exposure_idw_r10", "log_pop_density", "pct_pop_rural")], use = "complete.obs")
+
+m_r10   <- feols(as.formula(paste("overdose_rate_puma ~ prison_exposure_idw_r10 +", controls)),
+                 data = puma_df, cluster = ~state_fips)
+m_cnt10 <- feols(as.formula(paste("overdose_rate_puma ~ num_prisons_within_10km +", controls)),
+                 data = puma_df, cluster = ~state_fips)
+etable(m13, m_r10, m_cnt10, fitstat = ~ r2 + aic + n)
+```
+
+## Rural subset and save
+
+```{r}
+#| label: rural-subset
+# Rural PUMAs: more than 50% of the population lives in non-metro (RUCA 4-10) tracts.
+puma_rural <- puma_df %>% filter(pct_pop_nonmetro > 50)
+```
+
+```{r}
+#| label: save
+# Read these back with GEOID20 and state_fips as text to keep the leading zeros
+write_csv(puma_df, "data/final/national_puma_dataset.csv")
+write_csv(puma_rural, "data/final/rural_puma_dataset.csv")
+```
+
+# Variables {.unnumbered}
+
+| Variable | Meaning | Source |
+|----|----|----|
+| `GEOID20`, `state_fips` | 7-digit PUMA ID; 2-digit state code | boundary file |
+| `STATEFP20`, `PUMACE20`, `NAMELSAD20`, `ALAND20`, `AWATER20`, … | other boundary-file columns (land and water area in m²) | boundary file |
+| `total_pop`, `log_pop` | non-institutional population (average over 2020–2024) and its log | IPUMS |
+| `pct_nonwhite`, `pct_nonwhite_nh` | \% not White; % not non-Hispanic White | IPUMS |
+| `pct_bachelors_plus` | \% of people 25+ with a bachelor's or more | IPUMS |
+| `pct_poverty` | \% below the poverty line | IPUMS |
+| `pct_unemployed` | \% of the labor force unemployed | IPUMS |
+| `medhhinc`, `log_medhhinc` | median household income (2024 \$) and its log | IPUMS |
+| `pct_divorced_past_yr` | \% of ever-married people divorced in the past 12 months | IPUMS |
+| `pct_divorced_past_yr_atrisk`, `pct_currently_divorced` | alternative divorce measures | IPUMS |
+| `n_person_sample`, `n_hh_sample`, `n_divorced_sample` | unweighted sample sizes | IPUMS |
+| `overdose_rate_puma` | overdose deaths per 100,000 (2024) | CDC |
+| `suicide_rate_puma`, `homicide_rate_puma` | suicide and homicide deaths per 100,000 (2024) | CDC |
+| `pct_pop_with_overdose_data`, `n_tracts` | \% of population in tracts with an overdose rate; number of tracts | CDC |
+| `pct_pop_metro`, `_micro`, `_small_town`, `_rural`, `pct_pop_nonmetro` | \% of population by RUCA tract type | RUCA |
+| `pct_area_nonmetro`, `rural_pop`, `rural_area`, `rural_both` | \% of land area in non-metro tracts; rural flags | RUCA + boundaries |
+| `land_area_km2`, `pop_density`, `log_pop_density` | land area; people per km²; log | boundary file + IPUMS |
+| `prison_present`, `num_prisons` | any / number of prisons inside the PUMA | prisons |
+| `dist_to_nearest_prison_km` | km from the centroid to the nearest prison | prisons |
+| `num_prisons_within_5km`, `_10km` | prisons within 5 / 10 km of the centroid | prisons |
+| `prison_exposure_idw` | IDW over the 5 nearest prisons | prisons |
+| `prison_exposure_idw_auto_od`, `_auto_div` | IDW, K chosen by fit for overdose / divorce | prisons |
+| `prison_exposure_idw_r50`, `n_prisons_within_r50` | IDW and count, prisons within 50 km | prisons |
+| `prison_exposure_idw_r_auto_od`, `_auto_div` | IDW, radius chosen by fit for overdose / divorce | prisons |
+| `prison_exposure_idw_r10` | IDW, prisons within 10 km | prisons |

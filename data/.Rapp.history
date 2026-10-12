@@ -1,1 +1,3 @@
 load("/Users/natalie_novoseltseva/Documents/sproj/data/ccf_geocoded_v1.rds")
+load("/Users/natalie_novoseltseva/Documents/sproj/data/38325-0001-Data.rda")
+load("/Users/natalie_novoseltseva/Documents/sproj/data/ccf_geocoded_v1.rds")

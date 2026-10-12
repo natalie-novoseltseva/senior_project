@@ -1,0 +1,282 @@
+---
+title: "Prison exposure"
+subtitle: "Tract-level distance-decay exposure, averaged to 2020 PUMAs"
+author: "Natalie Novoseltseva"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    code-tools: true
+editor:
+  markdown:
+    wrap: 72
+---
+
+# About this qmd {.unnumbered}
+
+Builds the prison exposure measures. Exposure is calculated for each
+census tract first and then averaged up to the PUMA, so it reflects how
+close prisons are to where people in the PUMA actually live. A prison
+just across the PUMA boundary counts the same as one inside it.
+
+The analysis qmd joins output if this qmd onto the 2022–2024 dataset.
+
+Main measure, for tract $t$ and decay scale $h$ (km):
+
+$$E_t(h) = \sum_{j} S_j \exp\left(-\frac{d_{tj}}{h}\right)$$
+
+$d_{tj}$ is the distance from the tract to prison $j$. With $S_j = 1$, a
+prison at distance 0 adds 1, a prison at distance $h$ adds 0.37, and one
+at $3h$ adds 0.05. Small $h$ means only nearby prisons count; large $h$
+means the regional concentration of prisons counts. I compute it for $h$
+= 1, 5, 10, and 25, once with every prison counted equally ($S_j = 1$)
+and once weighting prisons by capacity (in thousands of beds). h = 1 km
+is the main measure.
+
+The PUMA value is the average of its tracts, weighted by each tract's
+non-institutional population (2020 census total minus people in
+institutional group quarters), so incarcerated people don't give prison
+tracts extra weight:
+
+$$E_p = \frac{\sum_{t \in p} W_t E_t}{\sum_{t \in p} W_t}$$
+
+Also built, as alternatives: whether there's a prison inside the PUMA
+boundary, how many, and the distance from the average resident to the
+nearest prison.
+
+"Prisons" always means open state and federal facilities.
+
+Outputs, in `data/final/`:
+
+-   `tract_prison_exposure.csv`: exposure for every tract
+-   `puma_prison_exposure.csv`: PUMA-level exposure, one row per PUMA.
+    This is what `nationl_puma_analysis_2022_2024.qmd` reads.
+
+# Setup
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(sf)
+library(tigris)      
+library(tidycensus)  
+
+options(tigris_use_cache = TRUE)
+
+state_fips <- unique(tidycensus::fips_codes$state_code)[1:51]   # 50 states + DC
+h_values   <- c(1, 5, 10, 25)                                  # decay scales, km
+
+```
+
+# Prisons
+
+```{r}
+#| label: prisons
+prisons_raw <- st_read("data/raw/prison-boundaries-1-geojson.geojson", quiet = TRUE) %>%
+  st_make_valid()
+
+# Open state and federal prisons, as points in a meters-based CRS (EPSG:5070).
+# -999 is the source's missing-value code for capacity.
+prisons <- prisons_raw %>%
+  filter(STATUS == "OPEN", TYPE %in% c("STATE", "FEDERAL")) %>%
+  mutate(CAPACITY = na_if(CAPACITY, -999)) %>%
+  st_centroid() %>%
+  st_transform(5070)
+
+nrow(prisons)                         # should be 2005
+table(prisons$TYPE)
+
+# Is capacity reliable enough for the capacity-weighted measure? (No)
+sum(is.na(prisons$CAPACITY))          # missing capacity
+sum(prisons$CAPACITY <= 0, na.rm = TRUE)   # zero or negative 
+summary(prisons$CAPACITY)
+```
+
+The capacity-weighted measure leaves out prisons with missing capacity.
+
+# Tract locations and weights
+
+Tract boundaries are downloaded once and saved as one point per tract.
+`st_point_on_surface()` keeps the point inside the tract, which a
+centroid doesn't always do for oddly shaped tracts.
+
+```{r}
+#| label: tract-points-download
+#| eval: false
+
+# One point per 2020 census tract, placed at the tract's center of population
+# (Census Bureau, 2020 Centers of Population): the average location of where the
+# tract's residents live, rather than the geometric middle of the tract.
+# Not run when rendering; the saved file is read in the next chunk.
+#read_csv("https://www2.census.gov/geo/docs/reference/cenpop2020/tract/CenPop2020_Mean_TR.txt",
+#         col_types = cols(STATEFP = "c", COUNTYFP = "c", TRACTCE = "c")) %>%
+#  mutate(GEOID = paste0(STATEFP, COUNTYFP, TRACTCE)) %>%
+#  filter(STATEFP %in% state_fips) %>%                            # 50 states + DC
+#  st_as_sf(coords = c("LONGITUDE", "LATITUDE"), crs = 4269) %>%  # Census coordinates (NAD83)
+#  st_transform(5070) %>%                                         # same projection as before, distances in meters
+#  select(GEOID) %>%
+#  st_write("data/raw/tract_popcenters_2020.gpkg", delete_dsn = TRUE, quiet = TRUE)
+```
+
+```{r}
+#| label: tract-points-load
+tract_pts <- st_read("data/raw/tract_popcenters_2020.gpkg", quiet = TRUE)
+
+nrow(tract_pts)   # ~84,000
+```
+
+```{r}
+#| label: tract-weights
+# GEOID is read as text so the leading zeros survive.
+tract_pop_2020 <- read_csv("data/raw/tract_pop_2020.csv",
+                           col_types = cols(GEOID = col_character()))
+
+# Census tract -> 2020 PUMA relationship file.
+rel20 <- read_csv("https://www2.census.gov/geo/docs/maps-data/data/rel2020/2020_Census_Tract_to_2020_PUMA.txt",
+                  col_types = cols(.default = "c")) %>%
+  transmute(GEOID   = paste0(STATEFP, COUNTYFP, TRACTCE),
+            GEOID20 = paste0(STATEFP, PUMA5CE))
+
+# Non-institutionalized population as the weight: total 2020 population minus people
+# in institutional group quarters (prisons, nursing homes, etc.).
+tract_weights <- tract_pop_2020 %>%
+  mutate(pop_noninst = tot_pop - pop_inst_gq) %>%
+  select(GEOID, tot_pop, pop_noninst, pop_correctional) %>%
+  left_join(rel20, by = "GEOID")
+
+# Checks
+tract_pts %>%
+  st_drop_geometry() %>%
+  summarise(share_with_weight = mean(GEOID %in% tract_weights$GEOID))   # want ~1
+
+tract_weights %>%
+  select(pop_noninst) %>%
+  summary()
+```
+
+# Tract-level exposure
+
+Distances from every tract to every prison, including prisons in other
+states. This is done one state at a time because the full 84,000 × 2,005
+distance matrix doesn't fit in memory. It takes a few minutes the first
+time; after that the saved file is read.
+
+```{r}
+#| label: tract-exposure
+#| label: tract-exposure-compute
+#| eval: false
+# One-time computation of tract exposure to prisons. Slow and memory-heavy.
+# Not run when rendering; the saved file is read in the next chunk.
+# Each prison adds exp(-distance / h).
+#prison_info <- prisons %>%
+#  st_drop_geometry() %>%
+#  transmute(prison_id = row_number())
+
+#tibble(
+#  GEOID     = rep(tract_pts$GEOID, times = nrow(prisons)),
+#  prison_id = rep(prison_info$prison_id, each = nrow(tract_pts)),
+#  d_km      = as.numeric(st_distance(tract_pts, prisons)) / 1000
+#) %>%
+#  left_join(prison_info, by = "prison_id") %>%
+#  group_by(GEOID) %>%
+#  summarise(
+#    dist_nearest_prison_km = min(d_km),
+    # every prison counts 1
+#    prison_exp_h1   = sum(exp(-d_km / 1)),
+#    prison_exp_h5   = sum(exp(-d_km / 5)),
+#    prison_exp_h10  = sum(exp(-d_km / 10)),
+#    prison_exp_h25  = sum(exp(-d_km / 25)),
+#  ) %>%
+#  write_csv("data/final/tract_prison_exposure.csv")
+```
+
+```{r}
+#| label: tract-exposure-load
+tract_exposure <- read_csv("data/final/tract_prison_exposure.csv",
+                           col_types = cols(GEOID = col_character()))
+
+nrow(tract_exposure)   # ~84,000
+
+tract_exposure %>%
+  select(starts_with("prison_exp_h")) %>%
+  summary()
+```
+
+# PUMA-level exposure
+
+```{r}
+#| label: puma-exposure
+# Population-weighted average of tract exposure (weights: non-institutionalized population)
+exposure_vars <- c("dist_nearest_prison_km",
+                   paste0("prison_exp_h", h_values))
+
+puma_exposure_decay <- tract_exposure %>%
+  left_join(tract_weights, by = "GEOID") %>%
+  filter(!is.na(GEOID20), pop_noninst > 0) %>%
+  group_by(GEOID20) %>%
+  summarise(
+    across(all_of(exposure_vars), ~ weighted.mean(.x, pop_noninst)),
+    n_tracts_exposure = n()
+  ) %>%
+  rename(dist_nearest_prison_km_popw = dist_nearest_prison_km)   # distance for the average resident
+
+# Presence and count inside the PUMA boundary (alternative measures)
+# 2020 PUMA boundaries (cached by tigris after the first download)
+pumas <- map_dfr(state_fips, ~ tigris::pumas(state = .x, cb = TRUE, year = 2020)) %>%
+  select(GEOID20) %>%
+  st_transform(5070)
+
+prisons_in_puma <- st_join(prisons, pumas, join = st_within) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(GEOID20)) %>%
+  count(GEOID20, name = "num_prisons_in_puma")
+
+puma_exposure <- pumas %>%
+  st_drop_geometry() %>%
+  left_join(puma_exposure_decay, by = "GEOID20") %>%
+  left_join(prisons_in_puma, by = "GEOID20") %>%
+  mutate(
+    num_prisons_in_puma    = replace_na(num_prisons_in_puma, 0),
+    prison_present_in_puma = as.integer(num_prisons_in_puma > 0)
+  )
+
+nrow(puma_exposure)                       # 2462
+sum(is.na(puma_exposure$prison_exp_h25))  # ideally 0
+write_csv(puma_exposure, "data/final/puma_prison_exposure.csv")
+```
+
+# Checks
+
+```{r}
+#| label: checks
+# How the measures relate to each other: small h behaves like "is a prison nearby",
+# large h like "regional concentration of prisons".
+puma_exposure %>%
+  select(prison_present_in_puma, num_prisons_in_puma, 
+         starts_with("prison_exp_h")) %>%
+  cor(use = "complete.obs", method = "spearman") %>%
+  round(2)
+
+# Distribution of the measure
+summary(puma_exposure$prison_exp_h5)
+
+# map of the h = 5 km measure
+pumas %>%
+  left_join(puma_exposure, by = "GEOID20") %>%
+  filter(!substr(GEOID20, 1, 2) %in% c("02", "15")) %>%
+  ggplot() +
+  geom_sf(aes(fill = prison_exp_h5), colour = NA) +
+  scale_fill_viridis_c(name = "Exposure\n(h = 5 km)", trans = "sqrt") +
+  theme_void()
+```
+
+# Variables added {.unnumbered}
+
+| Variable | Meaning |
+|------------------------------------------|------------------------------|
+| `prison_exp_h1`, `_h5`, `_h10`, `_h25`, `_h50`, `_h100` | distance-decay exposure, every prison counts equally (h = 25 is the main measure) |
+| `prison_exp_cap_h1` … `_h100` | same, prisons weighted by capacity in thousands of beds; prisons with unknown capacity left out |
+| `num_prisons_in_puma`, `prison_present_in_puma` | prisons inside the PUMA boundary; any (0/1) |
+| `n_tracts_exposure` | number of tracts averaged |

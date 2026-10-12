@@ -1,0 +1,804 @@
+---
+title: "NYS Analysis (county-level)"
+author: "Natalie Novoseltseva"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    code-tools: true
+    fig-width: 9
+    fig-height: 5.5
+editor:
+  markdown:
+    wrap: 72
+knitr:
+  opts_knit:
+    root.dir: "../.."
+  opts_chunk:
+    fig.path: "figures/nys/"
+    dev: ["png", "pdf"]
+---
+
+## Setup
+
+```{r}
+library(readr)
+library(dplyr)
+library(tibble)
+library(fixest)
+library(broom)
+library(gt)
+library(car)
+library(ggplot2)
+
+knitr::opts_chunk$set(fig.path = "figures/", dpi = 300)
+
+getwd()
+```
+
+## Data
+
+```{r}
+master_nys <- read_csv("../../data/final/master_nys.csv")
+#master_nys <- read_csv("data/final/master_nys.csv")
+```
+
+```{r}
+hist(master_nys$dv_female_rate)
+```
+
+Derived variables used across the models below: log-transformed population and
+income (both highly skewed, so log is the appropriate scale for a linear
+model), a non-white population share, and sex-offense domestic violence rates
+broken out by female and male victims specifically.
+
+```{r}
+master_nys <- master_nys %>%
+  mutate(
+    log_pop = log(tot_pop),
+    log_medhhinc = log(medhhinc),
+    pct_nonwhite = 1 - pct_white,
+    dv_sex_offense_female_rate = `Sex Offense_female_intimate_partner` / tot_pop * 100000,
+    dv_sex_offense_male_rate   = `Sex Offense_male_intimate_partner` / tot_pop * 100000,
+    num_prisons = factor(num_prisons)
+  ) %>% 
+  
+```
+
+```{r}
+nyc_geoids <- c("36005", "36047", "36061", "36081", "36085")  # Bronx, Kings, New York, Queens, Richmond
+  
+nys_no_nyc <- master_nys %>% 
+  filter(!GEOID %in% nyc_geoids)
+  
+nys_no_nyc_2224 <- master_nys %>%
+  filter(year >= 2022, !GEOID %in% nyc_geoids)
+```
+
+---
+
+## Variable Definitions
+
+**Exposure variables** (the prison-presence measures being studied):
+
+- `prison_present` — binary indicator, any open prison in the county
+- `num_open` — count of open prisons in the county
+
+**Outcome variables** (what the exposure is hypothesized to affect):
+
+- Domestic violence: `dv_total_rate`, `dv_female_rate`, `dv_male_rate`, `dv_agg_assault_rate`, `dv_sex_offense_rate`, `dv_sex_offense_female_rate`, `dv_sex_offense_male_rate`
+- Mortality/distress: `overdose_rate`, `suicide_rate`, `homicide_rate`
+- Household/economic: `divorce_rate`, `life_exp_weighted`, `medhhinc`
+
+**Confounders** (pre-existing county characteristics that could affect both
+prison siting and the outcomes above — these belong in the model as controls):
+
+- `pct_nonwhite`, `log_medhhinc`, `poverty_rate`, `unemp_rate`, `RUCC_2023`, `pct_bachelors_plus`, `log_pop`
+- `single_parent_rate` is a judgment call: plausibly a pre-existing confounder, but worth flagging as a limitation rather than treating as clean-cut
+
+**Mediators** (variables that sit *between* exposure and outcome — plausible
+consequences of prison presence rather than pre-existing causes of it). These
+are deliberately **excluded** from the main models, since controlling for a
+mediator blocks the causal pathway being estimated; they are examined
+separately as robustness/mechanism checks instead:
+
+- `correctional_emplvl_rate` — prisons bring correctional jobs, which may affect household dynamics
+- `n_deaths`, `n_suicides` (in-custody) — consequences of having a prison, not pre-existing county traits
+- `staffing_gap_pct` — also downstream of prison presence
+
+---
+
+## Analysis: Prison Presence (Binary)
+
+Exploratory comparison of county-year outcomes by whether the county has an
+open prison. **Caveat:** this is a county-*year* panel (each county appears up
+to 6 times), so a plain two-sample t-test treats repeated observations from
+the same county as independent, which they are not — p-values here should be
+read as a first look, not a final result. The clustered-SE models further
+below are the more defensible version for anything reported formally.
+
+```{r}
+table(master_nys$prison_present)
+```
+
+```{r}
+vars_to_test <- c(
+  dv_total_rate = "DV Rate (Total)",
+  dv_female_rate = "DV Rate (Female victims)",
+  dv_male_rate = "DV Rate (Male victims)",
+  dv_agg_assault_rate = "DV Rate (Agg. Assault)",
+  dv_sex_offense_rate = "DV Rate (Sex Offense)",
+  suicide_rate = "Suicide Rate (community)",
+  overdose_rate = "Overdose Rate",
+  homicide_rate = "Homicide Rate",
+  life_exp_weighted = "Life Expectancy",
+  divorce_rate = "Divorce Rate",
+  medhhinc = "Median HH Income",
+  poverty_rate = "Poverty Rate",
+  unemp_rate = "Unemployment Rate",
+  homeown_rate = "Homeownership Rate",
+  pct_bachelors_plus = "% Bachelor's+",
+  single_parent_rate = "Single-Parent Rate"
+)
+
+run_ttest_table <- function(data, title, subtitle) {
+  results <- lapply(names(vars_to_test), function(v) {
+    d <- data %>% filter(!is.na(.data[[v]]), !is.na(prison_present))
+    t_result <- t.test(d[[v]] ~ d$prison_present)
+    tibble(
+      variable = vars_to_test[[v]],
+      mean_no_prison = t_result$estimate[1],
+      mean_prison = t_result$estimate[2],
+      difference = t_result$estimate[2] - t_result$estimate[1],
+      p_value = t_result$p.value
+    )
+  }) %>% bind_rows()
+
+  results %>%
+    gt() %>%
+    cols_label(
+      variable = "Variable", mean_no_prison = "No Prison",
+      mean_prison = "Prison Present", difference = "Difference", p_value = "p-value"
+    ) %>%
+    fmt_number(columns = c(mean_no_prison, mean_prison, difference), decimals = 3) %>%
+    fmt_number(columns = p_value, decimals = 4) %>%
+    tab_header(title = title, subtitle = subtitle) %>%
+    tab_style(style = cell_fill(color = "#fff3cd"), locations = cells_body(rows = p_value < 0.05))
+}
+
+run_ttest_table(
+  master_nys,
+  "NY County Outcomes by Prison Presence",
+  "Two-sample t-tests, county-year observations, 2019-2024"
+)
+```
+
+### Year-by-year comparison
+
+Splitting the pooled panel by year shows whether the pattern is consistent
+across time or driven by a specific year. **Caveat:** each single-year table
+uses only ~62 NY counties split between groups, so estimates here are noisier
+and p-values more volatile than the pooled version above — treat any one
+year's "significant" result with extra caution rather than as a standalone
+finding.
+
+```{r}
+years_available <- sort(unique(master_nys$year))
+years_available
+```
+
+```{r}
+run_ttest_table(
+  master_nys %>% filter(year == years_available[1]),
+  paste("NY County Outcomes by Prison Presence —", years_available[1]),
+  "Two-sample t-test, single year"
+)
+```
+
+```{r}
+run_ttest_table(
+  master_nys %>% filter(year == years_available[2]),
+  paste("NY County Outcomes by Prison Presence —", years_available[2]),
+  "Two-sample t-test, single year"
+)
+```
+
+```{r}
+run_ttest_table(
+  master_nys %>% filter(year == years_available[3]),
+  paste("NY County Outcomes by Prison Presence —", years_available[3]),
+  "Two-sample t-test, single year"
+)
+```
+
+```{r}
+run_ttest_table(
+  master_nys %>% filter(year == years_available[4]),
+  paste("NY County Outcomes by Prison Presence —", years_available[4]),
+  "Two-sample t-test, single year"
+)
+```
+
+```{r}
+run_ttest_table(
+  master_nys %>% filter(year == years_available[5]),
+  paste("NY County Outcomes by Prison Presence —", years_available[5]),
+  "Two-sample t-test, single year"
+)
+```
+
+```{r}
+run_ttest_table(
+  master_nys %>% filter(year == years_available[6]),
+  paste("NY County Outcomes by Prison Presence —", years_available[6]),
+  "Two-sample t-test, single year"
+)
+```
+
+---
+
+## Analysis: Prison Presence, County-Clustered Standard Errors
+
+The plain t-tests above treat each county-year row as independent, which
+overstates statistical confidence given the panel structure. These models
+correct for that by clustering standard errors at the county level, with and
+without year fixed effects (which absorb any NY-wide shock in a given year,
+e.g. COVID-era disruptions, common to all counties).
+
+```{r}
+clustered_results <- lapply(names(vars_to_test), function(v) {
+  d <- master_nys %>% filter(!is.na(.data[[v]]), !is.na(prison_present))
+
+  if (n_distinct(d$prison_present) < 2) {
+    return(tibble(
+      variable = vars_to_test[[v]], mean_no_prison = NA_real_,
+      estimate = NA_real_, std_error = NA_real_, p_value = NA_real_, n = nrow(d)
+    ))
+  }
+
+  model <- feols(as.formula(paste(v, "~ prison_present")), data = d, cluster = ~GEOID)
+  tidy_model <- tidy(model)
+  intercept_row <- tidy_model %>% filter(term == "(Intercept)")
+  prison_row <- tidy_model %>% filter(term == "prison_present")
+
+  if (nrow(intercept_row) == 0 | nrow(prison_row) == 0) {
+    return(tibble(
+      variable = vars_to_test[[v]], mean_no_prison = NA_real_,
+      estimate = NA_real_, std_error = NA_real_, p_value = NA_real_, n = nrow(d)
+    ))
+  }
+
+  tibble(
+    variable = vars_to_test[[v]],
+    mean_no_prison = intercept_row$estimate,
+    estimate = prison_row$estimate,
+    std_error = prison_row$std.error,
+    p_value = prison_row$p.value,
+    n = nrow(d)
+  )
+}) %>% bind_rows()
+
+clustered_results %>%
+  gt() %>%
+  cols_label(
+    variable = "Variable", mean_no_prison = "No Prison (baseline)",
+    estimate = "Effect of Prison Presence", std_error = "SE", p_value = "p-value", n = "N"
+  ) %>%
+  fmt_number(columns = c(mean_no_prison, estimate, std_error), decimals = 3) %>%
+  fmt_number(columns = p_value, decimals = 4) %>%
+  tab_header(
+    title = "Effect of Prison Presence on County Outcomes",
+    subtitle = "OLS with county-clustered standard errors, 2019-2024"
+  ) %>%
+  tab_style(style = cell_fill(color = "#fff3cd"), locations = cells_body(rows = p_value < 0.05)) %>%
+  tab_style(style = cell_fill(color = "#ffe0b3"), locations = cells_body(rows = p_value >= 0.05 & p_value < 0.10))
+```
+
+```{r}
+clustered_results_fe <- lapply(names(vars_to_test), function(v) {
+  d <- master_nys %>% filter(!is.na(.data[[v]]), !is.na(prison_present))
+
+  if (n_distinct(d$prison_present) < 2) {
+    return(tibble(
+      variable = vars_to_test[[v]], estimate = NA_real_,
+      std_error = NA_real_, p_value = NA_real_, n = nrow(d)
+    ))
+  }
+
+  model <- feols(as.formula(paste(v, "~ prison_present | year")), data = d, cluster = ~GEOID)
+  tidy_model <- tidy(model)
+  prison_row <- tidy_model %>% filter(term == "prison_present")
+
+  if (nrow(prison_row) == 0) {
+    return(tibble(
+      variable = vars_to_test[[v]], estimate = NA_real_,
+      std_error = NA_real_, p_value = NA_real_, n = nrow(d)
+    ))
+  }
+
+  tibble(
+    variable = vars_to_test[[v]],
+    estimate = prison_row$estimate,
+    std_error = prison_row$std.error,
+    p_value = prison_row$p.value,
+    n = nrow(d)
+  )
+}) %>% bind_rows()
+
+clustered_results_fe %>%
+  gt() %>%
+  cols_label(
+    variable = "Variable", estimate = "Effect of Prison Presence",
+    std_error = "SE", p_value = "p-value", n = "N"
+  ) %>%
+  fmt_number(columns = c(estimate, std_error), decimals = 3) %>%
+  fmt_number(columns = p_value, decimals = 4) %>%
+  tab_header(
+    title = "Effect of Prison Presence on County Outcomes",
+    subtitle = "OLS with year fixed effects, county-clustered SEs, 2019-2024"
+  ) %>%
+  tab_style(style = cell_fill(color = "#fff3cd"), locations = cells_body(rows = p_value < 0.05)) %>%
+  tab_style(style = cell_fill(color = "#ffe0b3"), locations = cells_body(rows = p_value >= 0.05 & p_value < 0.10))
+```
+
+---
+
+## Analysis: Number of Open Prisons (Continuous)
+
+Rather than a binary presence indicator, these models use `num_open` (count of
+open prisons in the county) as the variable of interest, with a full set of
+county-level confounder controls. Each table shows the full model, not just
+the coefficient of interest, so the behavior of controls can be checked
+alongside it.
+
+```{r}
+controls <- "pct_nonwhite + log_medhhinc + poverty_rate + unemp_rate + RUCC_2023 + pct_bachelors_plus + log_pop"
+
+term_labels <- c(
+  "(Intercept)" = "Intercept",
+  "num_open" = "Number of Open Prisons",
+  "pct_nonwhite" = "% Non-White",
+  "log_medhhinc" = "Log(Median HH Income)",
+  "poverty_rate" = "Poverty Rate",
+  "unemp_rate" = "Unemployment Rate",
+  "RUCC_2023" = "Rurality (RUCC)",
+  "pct_bachelors_plus" = "% Bachelor's+",
+  "log_pop" = "Log(Population)"
+)
+
+run_full_model_table <- function(v, label, data, controls) {
+  # Avoid regressing income on itself when income is both outcome and control
+  ctrl_set <- if (v == "medhhinc") gsub(" \\+ log_medhhinc", "", controls) else controls
+  d <- data %>% filter(!is.na(.data[[v]]), !is.na(num_open))
+
+  formula_str <- paste(v, "~ num_open +", ctrl_set)
+  model <- feols(as.formula(formula_str), data = d, cluster = ~GEOID)
+
+  tidy(model) %>%
+    mutate(term_label = ifelse(term %in% names(term_labels), term_labels[term], term)) %>%
+    select(term_label, estimate, std.error, statistic, p.value) %>%
+    gt() %>%
+    cols_label(
+      term_label = "Term", estimate = "Estimate", std.error = "SE",
+      statistic = "t value", p.value = "p-value"
+    ) %>%
+    fmt_number(columns = c(estimate, std.error, statistic), decimals = 3) %>%
+    fmt_number(columns = p.value, decimals = 4) %>%
+    tab_header(
+      title = paste("Outcome:", label),
+      subtitle = paste0("OLS, county-clustered SEs, N = ", nobs(model))
+    ) %>%
+    tab_style(style = cell_fill(color = "#fff3cd"), locations = cells_body(rows = p.value < 0.05)) %>%
+    tab_style(style = cell_fill(color = "#ffe0b3"), locations = cells_body(rows = p.value >= 0.05 & p.value < 0.10))
+}
+```
+
+```{r}
+run_full_model_table("overdose_rate", "Overdose Rate", master_nys, controls)
+```
+
+```{r}
+run_full_model_table("suicide_rate", "Suicide Rate (community)", master_nys, controls)
+```
+
+```{r}
+run_full_model_table("medhhinc", "Median HH Income", master_nys, controls)
+```
+
+```{r}
+run_full_model_table("divorce_rate", "Divorce Rate", master_nys, controls)
+```
+
+```{r}
+run_full_model_table("dv_total_rate", "DV Rate (Total)", master_nys, controls)
+```
+
+```{r}
+run_full_model_table("dv_female_rate", "DV Rate (Female)", master_nys, controls)
+```
+
+```{r}
+run_full_model_table("dv_male_rate", "DV Rate (Male)", master_nys, controls)
+```
+
+```{r}
+glimpse(master_nys)
+```
+
+### Sex offense subcategory
+
+```{r}
+run_full_model_table("dv_sex_offense_rate", "DV Rate (Sex Offense, Total)", master_nys, controls)
+```
+
+```{r}
+run_full_model_table("dv_sex_offense_female_rate", "DV Rate (Sex Offense, Female Victims)", master_nys, controls)
+```
+
+```{r}
+run_full_model_table("dv_sex_offense_male_rate", "DV Rate (Sex Offense, Male Victims)", master_nys, controls)
+```
+
+### No NYC
+```{r}
+run_full_model_table("overdose_rate", "Overdose Rate", nys_no_nyc, controls)
+```
+
+```{r}
+run_full_model_table("suicide_rate", "Suicide Rate (community)", nys_no_nyc, controls)
+```
+
+```{r}
+run_full_model_table("medhhinc", "Median HH Income", nys_no_nyc, controls)
+```
+
+```{r}
+run_full_model_table("divorce_rate", "Divorce Rate", nys_no_nyc, controls)
+```
+
+```{r}
+run_full_model_table("dv_total_rate", "DV Rate (Total)", nys_no_nyc, controls)
+```
+
+```{r}
+run_full_model_table("dv_female_rate", "DV Rate (Female)", nys_no_nyc, controls)
+```
+
+```{r}
+run_full_model_table("dv_male_rate", "DV Rate (Male)", nys_no_nyc, controls)
+```
+
+### No NYC (2022-2024)
+```{r}
+run_full_model_table("overdose_rate", "Overdose Rate", nys_no_nyc_2224, controls)
+```
+
+```{r}
+run_full_model_table("suicide_rate", "Suicide Rate (community)", nys_no_nyc_2224, controls)
+```
+
+```{r}
+run_full_model_table("medhhinc", "Median HH Income", nys_no_nyc_2224, controls)
+```
+
+```{r}
+run_full_model_table("divorce_rate", "Divorce Rate", nys_no_nyc_2224, controls)
+```
+
+```{r}
+run_full_model_table("dv_total_rate", "DV Rate (Total)", nys_no_nyc_2224, controls)
+```
+
+```{r}
+run_full_model_table("dv_female_rate", "DV Rate (Female)", nys_no_nyc_2224, controls)
+```
+
+```{r}
+run_full_model_table("dv_male_rate", "DV Rate (Male)", nys_no_nyc_2224, controls)
+```
+
+---
+
+## Model Diagnostics & Robustness Checks
+
+```{r}
+
+# Scatterplot 1: Number of Open Prisons vs. Female DV Rate
+ggplot(master_nys, aes(x = num_open, y = dv_female_rate)) +
+  geom_point(alpha = 0.6, color = "#2c7fb8") +
+  geom_smooth(method = "lm", color = "darkred", se = TRUE) +
+  labs(
+    title = "Number of Open Prisons vs. Domestic Violence Rate (Female Victims)",
+    x = "Number of Open Prisons",
+    y = "DV Rate, Female Victims (per 100k)"
+  ) +
+  theme_minimal()
+
+# Bar plot version: Mean Female DV Rate by Number of Open Prisons
+dv_by_num_open <- master_nys %>%
+  filter(!is.na(num_open), !is.na(dv_female_rate)) %>%
+  group_by(num_open) %>%
+  summarise(
+    mean_dv_female = mean(dv_female_rate, na.rm = TRUE),
+    n = n()
+  )
+
+ggplot(dv_by_num_open, aes(x = factor(num_open), y = mean_dv_female)) +
+  geom_col(fill = "#2c7fb8") +
+  geom_text(aes(label = paste0("n=", n)), vjust = -0.5, size = 3) +
+  labs(
+    title = "Mean Domestic Violence Rate (Female Victims) by Number of Open Prisons",
+    x = "Number of Open Prisons",
+    y = "Mean DV Rate, Female Victims (per 100k)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Scatterplot 2: Unemployment Rate vs. Female DV Rate
+ggplot(master_nys, aes(x = unemp_rate, y = dv_female_rate)) +
+  geom_point(alpha = 0.6, color = "#2c7fb8") +
+  geom_smooth(method = "lm", color = "darkred", se = TRUE) +
+  labs(
+    title = "Unemployment Rate vs. Domestic Violence Rate (Female Victims)",
+    x = "Unemployment Rate",
+    y = "DV Rate, Female Victims (per 100k)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Bar graph 1: Average Female DV Rate by Year
+yearly_dv <- master_nys %>%
+  group_by(year) %>%
+  summarise(mean_dv_female = mean(dv_female_rate, na.rm = TRUE))
+
+ggplot(yearly_dv, aes(x = factor(year), y = mean_dv_female)) +
+  geom_col(fill = "#2c7fb8") +
+  labs(
+    title = "Average DV Rate (Female Victims) by Year",
+    x = "Year",
+    y = "Mean DV Rate, Female Victims (per 100k)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Bar graph 2: Average Unemployment Rate by Year
+yearly_unemp <- master_nys %>%
+  group_by(year) %>%
+  summarise(mean_unemp = mean(unemp_rate, na.rm = TRUE))
+
+ggplot(yearly_unemp, aes(x = factor(year), y = mean_unemp)) +
+  geom_col(fill = "#2c7fb8") +
+  labs(
+    title = "Average Unemployment Rate by Year",
+    x = "Year",
+    y = "Mean Unemployment Rate"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Bar graph 3: Total Number of Open Prisons by Year (statewide sum)
+yearly_prisons <- master_nys %>%
+  group_by(year) %>%
+  summarise(total_num_open = sum(num_open, na.rm = TRUE))
+
+ggplot(yearly_prisons, aes(x = factor(year), y = total_num_open)) +
+  geom_col(fill = "#2c7fb8") +
+  labs(
+    title = "Total Number of Open Prisons by Year (Statewide)",
+    x = "Year",
+    y = "Total Open Prisons"
+  ) +
+  theme_minimal()
+```
+
+
+### Collinearity check
+
+```{r}
+master_nys %>%
+  select(unemp_rate, poverty_rate, log_medhhinc, RUCC_2023) %>%
+  cor(use = "complete.obs")
+```
+
+```{r}
+model_vif <- lm(dv_female_rate ~ num_open + pct_nonwhite + log_medhhinc + poverty_rate + unemp_rate + RUCC_2023 + pct_bachelors_plus + log_pop, data = master_nys)
+vif(model_vif)
+```
+
+VIFs are all well under the conventional 5–10 concern threshold, so
+multicollinearity does not explain the unemployment coefficient's direction.
+
+### Outlier / influence check
+
+```{r}
+d <- master_nys %>% filter(!is.na(dv_female_rate), !is.na(unemp_rate))
+d %>% arrange(desc(unemp_rate)) %>% select(county_name, year, unemp_rate, dv_female_rate) %>% head(10)
+d %>% arrange(unemp_rate) %>% select(county_name, year, unemp_rate, dv_female_rate) %>% head(10)
+```
+
+The negative unemployment–DV relationship holds across multiple counties and
+years (e.g. Sullivan, Broome at the high-unemployment end), not just a single
+outlier row.
+
+### Robustness to adding single-parent rate
+
+```{r}
+model_robust <- feols(dv_female_rate ~ num_open + pct_nonwhite + log_medhhinc + poverty_rate + unemp_rate + RUCC_2023 + pct_bachelors_plus + log_pop + single_parent_rate, data = master_nys, cluster = ~GEOID)
+summary(model_robust)
+```
+
+
+### DV data reporting consistency
+
+Administrative domestic violence data is known to undercount actual incidence
+and to do so unevenly across jurisdictions; this checks at least whether all
+counties report consistently across all years (a coarse, necessary but not
+sufficient check — it cannot detect *within-report* underreporting).
+
+```{r}
+master_nys %>%
+  group_by(county_name) %>%
+  summarise(n_years_reported = sum(!is.na(dv_female_rate))) %>%
+  arrange(n_years_reported)
+```
+
+All non-NYC counties report in all 6 years; NYC boroughs report 0 (excluded
+from this DCJS file at the source, consistent with the "NON-NEW YORK CITY
+COUNTIES" filtering applied during data cleaning). Reporting-volume gaps are
+therefore ruled out, though differences in underlying reporting *rate* across
+counties remain an unresolvable limitation of administrative DV data.
+
+---
+
+## Analysis: Specification Curve (Independent Confounder Blocks)
+
+Each table below adds `num_open` plus *one* confounder block on its own
+(demographics, economic, rurality, education), rather than building
+cumulatively — the "No Controls" and "+ Full" specifications serve as the two
+anchor points, and each middle table shows how a single block shifts the
+estimate and standard error in isolation from the others.
+
+```{r}
+specs <- list(
+  "No Controls" = "num_open",
+  "+ Demographics" = "num_open + pct_nonwhite",
+  "+ Economic" = "num_open + log_medhhinc + poverty_rate + unemp_rate",
+  "+ Rurality" = "num_open + RUCC_2023",
+  "+ Education" = "num_open + pct_bachelors_plus",
+  "+ Full" = "num_open + log_medhhinc + poverty_rate + unemp_rate + RUCC_2023 + pct_bachelors_plus + log_pop"
+)
+
+run_spec_table <- function(outcome, spec_name, data) {
+  d <- data %>% filter(!is.na(.data[[outcome]]), !is.na(num_open))
+  formula_str <- paste(outcome, "~", specs[[spec_name]])
+  model <- feols(as.formula(formula_str), data = d, cluster = ~GEOID)
+
+  tidy(model) %>%
+    mutate(term_label = ifelse(term %in% names(term_labels), term_labels[term], term)) %>%
+    select(term_label, estimate, std.error, statistic, p.value) %>%
+    gt() %>%
+    cols_label(
+      term_label = "Term", estimate = "Estimate", std.error = "SE",
+      statistic = "t value", p.value = "p-value"
+    ) %>%
+    fmt_number(columns = c(estimate, std.error, statistic), decimals = 3) %>%
+    fmt_number(columns = p.value, decimals = 4) %>%
+    tab_header(
+      title = paste0("Outcome: ", outcome, " — ", spec_name),
+      subtitle = paste0("OLS, county-clustered SEs, N = ", nobs(model))
+    ) %>%
+    tab_style(style = cell_fill(color = "#fff3cd"), locations = cells_body(rows = p.value < 0.05)) %>%
+    tab_style(style = cell_fill(color = "#ffe0b3"), locations = cells_body(rows = p.value >= 0.05 & p.value < 0.10))
+}
+```
+
+### Domestic Violence (Female)
+
+```{r}
+run_spec_table("dv_female_rate", "No Controls", master_nys)
+```
+
+```{r}
+run_spec_table("dv_female_rate", "+ Demographics", master_nys)
+```
+
+```{r}
+run_spec_table("dv_female_rate", "+ Economic", master_nys)
+```
+
+```{r}
+run_spec_table("dv_female_rate", "+ Rurality", master_nys)
+```
+
+```{r}
+run_spec_table("dv_female_rate", "+ Education", master_nys)
+```
+
+```{r}
+run_spec_table("dv_female_rate", "+ Full", master_nys)
+```
+
+### Overdose Rate
+
+```{r}
+run_spec_table("overdose_rate", "No Controls", master_nys)
+```
+
+```{r}
+run_spec_table("overdose_rate", "+ Demographics", master_nys)
+```
+
+```{r}
+run_spec_table("overdose_rate", "+ Economic", master_nys)
+```
+
+```{r}
+run_spec_table("overdose_rate", "+ Rurality", master_nys)
+```
+
+```{r}
+run_spec_table("overdose_rate", "+ Education", master_nys)
+```
+
+```{r}
+run_spec_table("overdose_rate", "+ Full", master_nys)
+```
+
+### Suicide Rate (community)
+
+```{r}
+run_spec_table("suicide_rate", "No Controls", master_nys)
+```
+
+```{r}
+run_spec_table("suicide_rate", "+ Demographics", master_nys)
+```
+
+```{r}
+run_spec_table("suicide_rate", "+ Economic", master_nys)
+```
+
+```{r}
+run_spec_table("suicide_rate", "+ Rurality", master_nys)
+```
+
+```{r}
+run_spec_table("suicide_rate", "+ Education", master_nys)
+```
+
+```{r}
+run_spec_table("suicide_rate", "+ Full", master_nys)
+```
+
+### Homicide Rate
+
+```{r}
+run_spec_table("homicide_rate", "No Controls", master_nys)
+```
+
+```{r}
+run_spec_table("homicide_rate", "+ Demographics", master_nys)
+```
+
+```{r}
+run_spec_table("homicide_rate", "+ Economic", master_nys)
+```
+
+```{r}
+run_spec_table("homicide_rate", "+ Rurality", master_nys)
+```
+
+```{r}
+run_spec_table("homicide_rate", "+ Education", master_nys)
+```
+
+```{r}
+run_spec_table("homicide_rate", "+ Full", master_nys)
+```

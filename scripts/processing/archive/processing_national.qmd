@@ -1,0 +1,691 @@
+---
+title: "processing_national"
+format: html
+---
+
+```{r}
+library(readr)
+library(tibble)
+library(dplyr)
+library(readr)
+library(tidyverse)
+library(readxl)
+library(sf)
+library(BLSloadR)
+library(tidycensus)
+library(dplyr)
+library(purrr)
+```
+
+Data
+
+ACS-5
+```{r}
+years <- c(2019, 2020, 2021, 2022, 2023, 2024)
+
+my_vars <- c(
+  # Population & demographics
+  tot_pop       = "B01003_001",
+  median_age    = "B01002_001",
+  white         = "C02003_003",
+  black         = "C02003_004",
+  asian         = "C02003_006",
+  hispanic      = "B03001_003",
+
+  # Economic wellbeing
+  medhhinc      = "B25119_001",
+  pop_poverty   = "B17001_002",
+  pop_poverty_universe = "B17001_001",
+  labor_force   = "B23025_003",
+  unemployed    = "B23025_005",
+
+  # Housing
+  hu_ownocc     = "B25003_002",
+  tot_hu        = "B25001_001",
+  rent_burden_30_35   = "B25070_007",  # 30.0-34.9%
+  rent_burden_35_40   = "B25070_008",  # 35.0-39.9%
+  rent_burden_40_50   = "B25070_009",  # 40.0-49.9%
+  rent_burden_50plus  = "B25070_010",  # 50.0%+
+  rent_total          = "B25070_001",
+  avg_hh_size   = "B25010_001",
+
+  # Education
+  edu_hs_or_less     = "B15003_017",
+  edu_bachelors_plus = "B15003_022",
+  edu_total          = "B15003_001",
+
+  # Family structure
+  divorced_m    = "B12001_010",
+  divorced_f    = "B12001_019",
+  single_dad_children = "B11003_010",   # male householder, no wife, with own children <18
+  single_mom_children = "B11003_016" ,
+# female householder, no husband, with own children <18
+married_m     = "B12001_004",
+  married_f     = "B12001_013"
+)
+
+
+census_data <- map_dfr(
+  years,
+  ~ get_acs(
+      geography = "county",
+      variables = my_vars,
+      year = .x,
+      survey = "acs5",
+      geometry = FALSE,
+      cache_table = TRUE
+    ) %>%
+    mutate(year = .x)
+  ) %>%
+  select(GEOID, NAME, variable, estimate, year) %>%
+  pivot_wider(names_from = variable, values_from = estimate) %>%
+  arrange(NAME, year)
+
+census_data <- census_data %>%
+  mutate(divorced = divorced_m + divorced_f,
+         married  = married_m + married_f)
+
+census_data <- census_data %>%
+  mutate(
+    divorce_rate = divorced / tot_pop * 100,
+    marriage_rate = married /tot_pop * 100
+  )
+```
+
+
+Prisons (ICPSR)
+```{r}
+#US Prisons (from ICPSR)
+#The raw dataset contains 6,468 prison facilities with geographic boundaries.
+#Two filters are applied: (1) only facilities with STATUS "OPEN" or "CLOSED" are
+#retained, dropping ambiguous or unknown statuses; (2) TYPE "COUNTY" is excluded,
+#removing local jails which were not sited as economic development tools and do not
+#fit the theoretical framework of the study. The cleaned dataset is then collapsed
+#to the county level using COUNTYFIPS, producing counts and capacity/population
+#totals broken out by status (open, closed, and combined).
+
+prisons_icpsr <- st_read("data/prison-boundaries-1-geojson.geojson")
+
+#names(prisons_icpsr)
+
+prisons_clean <- prisons_icpsr %>%
+  st_drop_geometry() %>%
+  filter(
+    STATUS %in% c("OPEN", "CLOSED"),
+    TYPE != "COUNTY"
+  )
+
+prisons_by_county <- prisons_clean %>%
+  group_by(COUNTYFIPS) %>%
+  summarise(
+    num_prisons        = n(),
+    num_open           = sum(STATUS == "OPEN"),
+    num_closed         = sum(STATUS == "CLOSED"),
+    capacity_total     = sum(CAPACITY, na.rm = TRUE),
+    capacity_open      = sum(CAPACITY[STATUS == "OPEN"],   na.rm = TRUE),
+    capacity_closed    = sum(CAPACITY[STATUS == "CLOSED"], na.rm = TRUE),
+    pop_total          = sum(POPULATION, na.rm = TRUE),
+    pop_open           = sum(POPULATION[STATUS == "OPEN"],   na.rm = TRUE),
+    pop_closed         = sum(POPULATION[STATUS == "CLOSED"], na.rm = TRUE)
+  )
+
+
+```
+
+Death counts
+```{r}
+#death counts and death rates for drug overdose, suicide, homicide and firearm injuries by county of residence
+
+#The raw dataset contains county-level death counts and rates for drug overdose,
+#firearm injuries, homicide, and suicide across multiple years. The data is filtered
+#to 2019 and restricted to three Intent categories relevant to the distress index:
+#Drug_OD, All_Suicide, and All_Homicide. Firearm-specific subcategories (FA_Suicide,
+#FA_Homicide, FA_Deaths) are dropped to avoid double-counting, as they are subsets
+#of the all-cause homicide and suicide totals. Rate is coerced to numeric, and the
+#dataset is pivoted to wide format so each county appears as a single row with
+#separate rate columns for each outcome. Small cell counts (1-9 deaths) reported
+#as ranges by the CDC are handled by using the pre-computed Rate column directly,
+#bypassing the suppression issue in the Count column entirely.
+
+
+injury_overdose_violence <- read_csv("data/injury_overdose_violence.csv")
+
+
+#2019
+injury_overdose_violence_2019 <- injury_overdose_violence %>%
+  filter(Period == "2019") %>%                        # fix: string not numeric
+  filter(Intent %in% c("Drug_OD", "All_Suicide",     # only what you need
+                        "All_Homicide")) %>%
+  mutate(Rate = as.numeric(Rate)) %>%                 # ensure numeric
+  pivot_wider(
+    id_cols    = c(GEOID, NAME, ST_GEOID, ST_NAME),
+    names_from  = Intent,
+    values_from = c(Rate),
+    names_glue  = "{Intent}_rate"
+  ) %>%
+  rename(
+    overdose_rate = Drug_OD_rate,
+    suicide_rate  = All_Suicide_rate,
+    homicide_rate = All_Homicide_rate
+  )
+
+
+```
+
+```{r}
+injury_overdose_violence <- read_csv("data/injury_overdose_violence.csv")
+
+injury_overdose_violence_19_24 <- injury_overdose_violence %>%
+  filter(Period %in% c("2019", "2020", "2021", "2022", "2023", "2024")) %>%
+  filter(Intent %in% c("Drug_OD", "All_Suicide", "All_Homicide")) %>%
+  mutate(Rate = as.numeric(Rate)) %>%
+  pivot_wider(
+    id_cols    = c(GEOID, NAME, ST_GEOID, ST_NAME, Period),
+    names_from = Intent,
+    values_from = Rate,
+    names_glue = "{Intent}_rate"
+  ) %>%
+  rename(
+    overdose_rate = Drug_OD_rate,
+    suicide_rate  = All_Suicide_rate,
+    homicide_rate = All_Homicide_rate,
+    year = Period
+  ) %>%
+  mutate(
+    year = as.numeric(year),
+    # CDC suppression sentinel -> true NA (affects small, mostly rural counties)
+    suicide_rate  = ifelse(suicide_rate  == -999, NA, suicide_rate),
+    homicide_rate = ifelse(homicide_rate == -999, NA, homicide_rate),
+    overdose_rate = ifelse(overdose_rate == -999, NA, overdose_rate)
+  )
+```
+
+
+Unemployment (BLS)
+```{r}
+#BLS (unemployment rate)
+
+# The raw BLS county unemployment file for 2019 is structured with the title row
+# as the first row and the actual column headers as the second row, a common BLS
+# formatting issue. The column names are manually assigned via set_names(), and the
+# spurious header row is dropped with slice(-1). Trailing footnote rows are removed
+# by filtering out blank state FIPS values. State and county FIPS codes, stored in
+# separate columns in the raw file, are padded to 2 and 3 digits respectively and
+# concatenated into a single 5-digit GEOID to match the join key used across all
+# other datasets. All numeric columns are coerced from character, and the dataset
+# is reduced to the GEOID, county name, and core labor force variables.
+
+#unemployment_2019 <- read_excel("data/unemployment19.xlsx")
+
+#unemployment_2019_clean <- unemployment_2019 %>%
+#  set_names(c("laus_code", "state_fips", "county_fips", 
+#              "county_name", "year", "labor_force", 
+#              "employed", "unemployed", "unemp_rate")) %>%
+#  slice(-1) %>%                                        
+#  filter(!is.na(state_fips), state_fips != "") %>%     
+#  mutate(
+#    GEOID     = paste0(
+#                  str_pad(state_fips,  2, pad = "0"),
+#                  str_pad(county_fips, 3, pad = "0")
+#                ),
+#    unemp_rate = as.numeric(unemp_rate),
+#    labor_force = as.numeric(labor_force),
+#    employed    = as.numeric(employed),
+#    unemployed  = as.numeric(unemployed)
+#  ) %>%
+#  select(GEOID, county_name, labor_force, employed, unemployed, unemp_rate)
+```
+
+Urban vs. Rural counties (USDA)
+```{r}
+rural_2023 <- read_csv("data/rural_urban_codes2023.csv")  # 1-3: urban, 4-9: rural
+
+rural_2023 <- rural_2023 %>%
+  pivot_wider(names_from = Attribute, values_from = Value) %>%
+  mutate(
+    Population_2020 = as.numeric(Population_2020),
+    RUCC_2023 = as.numeric(RUCC_2023))
+
+
+
+
+#2013
+# The 2013 Rural-Urban Continuum Codes (RUCC) from the USDA are already in wide
+# format with one row per county. The only cleaning needed is renaming FIPS to GEOID
+# for consistency with the join key used across all other datasets, and creating a
+# binary rural indicator following the standard USDA convention where codes 1-3
+# denote metro (urban) counties and codes 4-9 denote nonmetro (rural) counties.
+# The 2013 vintage is used rather than 2023 because it predates the 2019 outcome
+# year, which is the methodologically appropriate choice.
+
+#rural_2013 <- read_excel("data/rural_urban_codes2013.xls")
+
+#rural_2013_clean <- rural_2013 %>%
+#  rename(GEOID = FIPS) %>%
+#  mutate(rural = as.integer(RUCC_2013 >= 4)) %>%
+#  select(GEOID, State, County_Name, Population_2010, RUCC_2013, rural, Description)
+```
+
+Life Expectancy (from CDC, 2010-2015)
+
+```{r}
+# Life expectancy data comes from the USALEEP project (2010-2015), the most
+# comprehensive source of county-level life expectancy available for the contiguous
+# US. The raw file is at the census tract level (73,121 tracts), so it must be
+# aggregated to the county level. Rather than a simple mean, a population-weighted
+# mean is computed so that more populous tracts contribute proportionally more to
+# the county estimate, which better reflects the lived experience of the average
+# county resident. Tract-level population denominators are pulled from the 2011-2015
+# ACS 5-year estimates (variable B01003_001) via tidycensus, looping over all 51
+# state-level calls required by the API. A county FIPS crosswalk is constructed from
+# the built-in fips_codes dataframe in tidycensus and joined to the life expectancy
+# file on county name. Tract numbers in the USALEEP file (e.g. "0201.00") are
+# reformatted into standard 11-digit Census GEOIDs by removing the decimal point,
+# padding to 6 digits, and prepending the 5-digit county FIPS code. The 2010-2015
+# vintage is used as it is the only nationally comprehensive county-level life
+# expectancy dataset available; this measurement lag relative to the 2019 outcome
+# year is acknowledged as a limitation.
+
+life_expectancy <- read_csv("data/life_expectancy_2010-2015.csv")
+all_states <- unique(fips_codes$state)[1:51]
+tract_pop <- map_dfr(all_states, function(s) {
+  get_acs(
+    geography = "tract",
+    variables = c(tract_pop = "B01003_001"),
+    state     = s,
+    year      = 2015,
+    survey    = "acs5",
+    geometry  = FALSE
+  )
+}) %>%
+  select(GEOID, tract_pop = estimate)
+
+fips_xwalk <- fips_codes %>%
+  mutate(
+    county_full = paste0(county, ", ", state),
+    county_fips = paste0(state_code, county_code)
+  ) %>%
+  select(county_full, county_fips)
+
+life_expectancy_clean <- life_expectancy %>%
+  janitor::clean_names() %>%
+  filter(county != "(blank)", !is.na(census_tract_number)) %>%
+  left_join(fips_xwalk, by = c("county" = "county_full")) %>%
+  mutate(
+    tract_clean = str_remove(census_tract_number, "\\.") %>%
+                  str_pad(6, pad = "0"),
+    GEOID = paste0(county_fips, tract_clean)
+  )
+
+life_expectancy_county <- life_expectancy_clean %>%
+  left_join(tract_pop, by = "GEOID") %>%
+  group_by(county_fips, state, county) %>%
+  summarise(
+    life_exp_weighted = weighted.mean(life_expectancy,
+                                      w     = tract_pop,
+                                      na.rm = TRUE),
+    n_tracts = n()
+  ) %>%
+  ungroup() %>%
+  rename(GEOID = county_fips)
+```
+
+
+Occupation - Correctional Institution
+
+```{r}
+years_needed <- c(2019, 2020, 2021, 2022, 2023, 2024)
+
+agglvl_lookup <- c(
+  "2019" = 77, "2020" = 77, "2021" = 77,
+  "2022" = 77, "2023" = 77, "2024" = 78
+)
+
+occupation_19_24 <- map_dfr(years_needed, function(yr) {
+  file_path <- paste0("data/correctional_employment_", yr, ".csv")
+  occ_raw <- read_csv(file_path, show_col_types = FALSE)
+  target_code <- agglvl_lookup[[as.character(yr)]]
+
+  occ_raw %>%
+    filter(agglvl_code == target_code) %>%
+    group_by(area_fips) %>%
+    summarise(
+      correctional_emplvl = sum(annual_avg_emplvl, na.rm = TRUE),
+      any_suppressed      = any(disclosure_code == "N"),
+      any_reported        = any(is.na(disclosure_code) & annual_avg_emplvl > 0),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      corr_employ_cat = case_when(
+        any_reported   ~ "reported",
+        any_suppressed ~ "suppressed",
+        TRUE           ~ "none"
+      ),
+      year = yr
+    ) %>%
+    rename(GEOID = area_fips)
+})
+```
+
+##Religion
+```{r}
+religion <- read_excel("data/religion.xlsx", sheet = "Data")
+
+# Keep county identifiers, population, and the 6 RELTRAD family rates
+# (rate = adherents per 1,000 population, already normalized by county size)
+religion_clean <- religion %>%
+  select(
+    FIPS, COUNAM, STABBREV, STATNAM, POP2020,
+    total_rate     = TOTRATE_2020,
+    evangelical    = EVANRATE_2020,
+    mainline_prot  = MPRTRATE_2020,
+    black_prot     = BPRTRATE_2020,
+    catholic       = CATHRATE_2020,
+    orthodox       = ORTHRATE_2020,
+    other          = OTHRATE_2020
+  )
+
+head(religion_clean)
+str(religion_clean)
+
+# FIPS is your merge key for joining with county-level divorce data
+# (make sure it's formatted the same way — often needs to be a 
+# zero-padded 5-digit character string, not numeric)
+religion_clean$FIPS <- sprintf("%05d", as.numeric(religion_clean$FIPS))
+```
+
+
+Joining everything together
+
+
+
+```{r}
+prisons_static <- prisons_by_county %>% rename(GEOID = COUNTYFIPS)
+rural_static <- rural_2023 %>% rename(GEOID = FIPS)
+life_exp_static <- life_expectancy_county
+religion_static <- religion_clean %>%
+  rename(GEOID = FIPS)
+
+master_national <- census_data %>%
+  left_join(injury_overdose_violence_19_24, by = c("GEOID", "year")) %>%
+  left_join(occupation_19_24, by = c("GEOID", "year")) %>%
+  left_join(prisons_static, by = "GEOID") %>%
+  left_join(rural_static, by = "GEOID") %>%
+  left_join(life_exp_static, by = "GEOID") %>%
+  left_join(religion_static, by = "GEOID")
+```
+
+
+Cleaning the dataset
+
+```{r}
+master_national <- master_national %>%
+  mutate(
+   # correctional_emplvl = replace_na(correctional_emplvl, 0),
+   # corr_employ_cat = replace_na(corr_employ_cat, "none"),
+    num_prisons = replace_na(num_prisons, 0),
+    num_open = replace_na(num_open, 0),
+    num_closed = replace_na(num_closed, 0),
+    capacity_total = replace_na(capacity_total, 0),
+    pop_total = replace_na(pop_total, 0)
+  )
+```
+
+```{r}
+master_national <- master_national %>%
+  mutate(
+    prison_present = as.integer(num_open > 0),
+    num_open = as.factor(num_open),
+
+    # Correctional employment, per 100k population
+    correctional_emplvl_rate = correctional_emplvl / tot_pop * 1000,
+
+    # Economic / demographic percentages
+    poverty_rate      = pop_poverty / pop_poverty_universe*100,
+    unemp_rate        = unemployed / labor_force*100,
+    pct_white         = white / tot_pop*100,
+    pct_black         = black / tot_pop*100,
+    pct_asian         = asian / tot_pop*100,
+    pct_hispanic      = hispanic / tot_pop*100,
+    homeown_rate      = hu_ownocc / tot_hu*100,
+    pct_bachelors_plus = edu_bachelors_plus / edu_total*100,
+    pct_hs_or_less     = edu_hs_or_less / edu_total*100,
+    rent_burdened_30plus_rate = (rent_burden_30_35 + rent_burden_35_40 + rent_burden_40_50 + rent_burden_50plus) / rent_total*100,
+    single_parent_rate = (single_dad_children + single_mom_children) / tot_hu *100
+  )
+```
+
+```{r}
+master_national <- master_national %>%
+  select(-NAME.y) %>%
+  rename(NAME = NAME.x)
+```
+
+```{r}
+master_national %>%
+  select(GEOID, NAME, ST_GEOID, ST_NAME,
+         State, County_Name, state, county) %>%
+  head(20)
+
+master_national <- master_national %>%
+  select(
+    -ST_GEOID,
+    -ST_NAME,
+    -County_Name,
+    -state,
+    -county
+  )
+```
+
+```{r}
+write_csv(master_national, "data/final/master_national.csv")
+```
+
+
+##IPUMS Data
+
+IPUMS microdata (ACS PUMS) does not report county directly. The smallest 
+geography identified in the public-use data is the PUMA (Public Use Microdata 
+Area), a Census-defined region of at least 100,000 residents, created for 
+respondent confidentiality. IPUMS assigns a `COUNTY` value to a record only 
+when a PUMA (or a set of PUMAs) corresponds exactly to one whole county. 
+Smaller counties are folded into a shared,multi-county PUMA and cannot be 
+separately identified in the data. 
+
+### Step 1: Download and parse the Census PUMA-County Equivalency Files
+
+The Census Bureau publishes one fixed-width text file per state, mapping 2010
+PUMAs to their component counties (2010-vintage PUMAs are what the 2019 ACS
+uses). Each file is downloaded and parsed according to the Census Bureau's
+official field layout (start/end byte positions for each column, per their
+"2010 PUMA Equivalency File Format and Record Layout" documentation).
+
+```{r}
+# All state FIPS codes with a published equivalency file (all 50 states + DC + PR;
+# Guam and the U.S. Virgin Islands are excluded by the Census Bureau, since each
+# is treated as a single state-equivalent PUMA with no internal county breakdown)
+state_fips <- c("01","02","04","05","06","08","09","10","11","12","13","15","16","17","18","19",
+                 "20","21","22","23","24","25","26","27","28","29","30","31","32","33","34","35",
+                 "36","37","38","39","40","41","42","44","45","46","47","48","49","50","51","53",
+                 "54","55","56","72")
+
+base_url <- "https://www2.census.gov/geo/docs/reference/puma/"
+
+# Column widths and names taken directly from the Census Bureau's official
+# field layout document for the PUMSEQ10 (PUMA Equivalency 2010) files
+col_widths <- c(3, 2, 8, 5, 3, 8, 5, 8, 5, 8, 6, 9, 9, 100)
+col_names <- c("SL", "STATEFP", "STATENS", "PUMACE", "COUNTYFP", "COUNTYNS",
+                "COUSUBFP", "COUSUBNS", "PLACEFP", "PLACENS", "TRACTCE",
+                "POP10", "HU10", "NAME")
+
+puma_equiv_national <- map_dfr(state_fips, function(st) {
+  url <- paste0(base_url, "PUMSEQ10_", st, ".txt")
+  read_fwf(url, fwf_widths(col_widths, col_names = col_names), col_types = cols(.default = "c"))
+})
+
+nrow(puma_equiv_national)
+```
+
+### Step 2: Filter to the state-county-PUMA summary level
+
+Each file contains several nested "Summary Level" (SL) codes, ranging from
+coarse (state-PUMA only) to fine (down to census tract). **SL 796** is the
+"state-county-PUMA" level — the finest level that includes a county code
+without also pulling in county-subdivision, place, or tract detail that isn't
+needed here.
+
+```{r}
+county_puma <- puma_equiv_national %>%
+  filter(SL == "796") %>%
+  mutate(
+    STATEFP = trimws(STATEFP),
+    COUNTYFP = trimws(COUNTYFP),
+    PUMACE = trimws(PUMACE),
+    county_fips_full = paste0(STATEFP, COUNTYFP),   # 5-digit county FIPS, matches this thesis's GEOID convention
+    puma_full = paste0(STATEFP, PUMACE)              # PUMA codes are only unique within a state, so state must be prefixed
+  )
+
+nrow(county_puma)
+```
+
+### Step 3: Determine which counties are individually identifiable
+
+A county is identifiable in IPUMS only if every PUMA touching that county
+belongs to it exclusively (no other county shares that PUMA). A county can
+still be identifiable even if it's covered by multiple PUMAs, as long as none
+of those PUMAs cross into a neighboring county.
+
+```{r}
+# Count how many distinct counties each PUMA touches
+puma_county_count <- county_puma %>%
+  count(puma_full, name = "n_counties")
+
+# A county is identifiable only if ALL of its PUMAs are exclusive to it (n_counties == 1)
+county_puma_status <- county_puma %>%
+  left_join(puma_county_count, by = "puma_full") %>%
+  group_by(county_fips_full) %>%
+  summarise(identifiable = all(n_counties == 1), .groups = "drop")
+
+table(county_puma_status$identifiable, useNA = "ifany")
+nrow(county_puma_status)
+```
+
+### Step 4: Apply the check to this thesis's prison-county sample
+
+```{r}
+your_prison_counties <- prisons_by_county$COUNTYFIPS
+
+county_puma_status %>%
+  filter(county_fips_full %in% your_prison_counties) %>%
+  count(identifiable)
+```
+
+Nationally, only 433 of 3,221 counties (~13%) are individually
+identifiable in IPUMS microdata; the remaining ~87% are merged into shared,
+multi-county PUMAs due to the 100,000-resident confidentiality threshold. 
+
+
+
+
+
+
+
+```{r}
+ny_pumas <- pumas(state="NY", cb = TRUE, year = 2019)
+
+ p2 <- ggplot() +
+  geom_sf(data = ny_pumas, fill = NA, color = "blue") +
+  theme_minimal()
+
+p2
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,1360 @@
+---
+title: "National analysis (puma-level)"
+author: "Natalie Novoseltseva"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    code-tools: true
+    fig-width: 9
+    fig-height: 5.5
+editor:
+  markdown:
+    wrap: 72
+knitr:
+  opts_knit:
+    root.dir: "../.."
+  opts_chunk:
+    fig.path: "figures/national/"
+    dev: ["png", "pdf"]
+---
+
+# About this qmd
+
+This qmd includes the national analysis: all 2,462 PUMAs in the 50 states and DC. 
+
+It reads two saved files and joins them:
+
+-   `data/final/national_puma_dataset_2022_2024.gpkg` from
+    `processing_national_pumas_2022_2024.qmd`: outcomes, controls and
+    PUMA boundaries
+-   `data/final/puma_prison_exposure.csv` from
+    `processing_prison_exposure.qmd`: the prison exposure measures
+
+Outcomes:
+
+-   `overdose_rate_2022_2024`: overdose deaths per 100,000, pooled
+    2022–2024 (CDC tract data)
+-   `pct_divorced_past_yr`: % of ever-married people who divorced in the
+    past year, pooled 2022–2024 ACS
+
+Exposure: distance-decay exposure to open state and federal prisons, Σ exp(−d/h) over all prisons, built for each tract and averaged over the PUMA's tracts with non-institutional population as weights. The main measure is h = 10 km (?); h = 1, 5 and 25 km, the number of prisons inside the PUMA and any prison inside the PUMA are reported alongside it.
+
+Sections:
+
+1.  Descriptives: summary statistics, maps, correlations and unadjusted group comparisons
+2.  Staged OLS models (M1 to M3), SEs clustered by state
+3.  Spatial diagnostics: Moran's I on the outcomes and on the M3 residuals
+4.  Spatial models: SEM and SDEM, model checks
+5
+
+# Setup
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(sf)
+library(gt)
+library(broom)
+library(fixest)
+library(spdep)
+library(spatialreg)
+library(tigris)
+library(patchwork)
+
+options(tigris_use_cache = TRUE)
+set.seed(2024)
+```
+
+## Data
+
+```{r}
+#| label: data-load
+# Exposure measures from processing_prison_exposure.qmd, outcomes and controls (with boundaries)
+# from processing_national_pumas_2022_2024.qmd
+exposure <- read_csv("data/final/puma_prison_exposure.csv",
+                     col_types = cols(GEOID20 = col_character()))
+
+puma_geo <- st_read("data/final/national_puma_dataset_2022_2024.gpkg", quiet = TRUE) %>%
+  select(-any_of(setdiff(names(exposure), "GEOID20"))) %>%   # avoid .x/.y if the gpkg already has exposure columns
+  left_join(exposure, by = "GEOID20")
+
+puma_df <- puma_geo %>% st_drop_geometry()
+
+nrow(puma_df)   # 2462
+
+# Outcomes and their labels, used throughout
+outcomes <- c(
+  overdose_rate_2022_2024 = "Overdose deaths per 100,000",
+  pct_divorced_past_yr    = "% of ever-married divorced in past year"
+)
+
+# Lower 48 for maps (Alaska and Hawaii would stretch the map); projected for correct shapes
+puma_geo_l48 <- puma_geo %>%
+  filter(!state_fips %in% c("02", "15")) %>%
+  st_transform(5070)
+
+# Open state and federal prisons, for plotting on the maps
+prisons <- st_read("data/raw/prison-boundaries-1-geojson.geojson", quiet = TRUE) %>%
+  st_make_valid() %>%
+  filter(STATUS == "OPEN", TYPE %in% c("STATE", "FEDERAL")) %>%
+  st_centroid() %>%
+  st_transform(5070) %>%
+  st_filter(st_union(puma_geo_l48))
+```
+
+# DESCRIPTIVES
+
+## Summary statistics
+
+```{r}
+#| label: summary-stats
+summary_vars <- c(names(outcomes),
+                  "prison_exp_h1", "prison_exp_h5", "prison_exp_h10", "prison_exp_h25",
+                   "num_prisons_in_puma",
+                  "pop_density", "pct_pop_rural", "pct_pop_nonmetro")
+
+puma_df %>%
+  select(all_of(summary_vars)) %>%
+  pivot_longer(everything(), names_to = "variable") %>%
+  group_by(variable) %>%
+  summarise(n = sum(!is.na(value)),
+            mean = mean(value, na.rm = TRUE), sd = sd(value, na.rm = TRUE),
+            min = min(value, na.rm = TRUE), median = median(value, na.rm = TRUE),
+            max = max(value, na.rm = TRUE)) %>%
+  mutate(variable = factor(variable, levels = summary_vars)) %>%
+  arrange(variable) %>%
+  gt() %>%
+  fmt_number(columns = c(mean, sd, min, median, max), decimals = 2) %>%
+  tab_header(title = "Summary statistics, PUMAs (2022–2024)")
+
+table(puma_df$prison_present_in_puma, useNA = "ifany")   # PUMAs with / without a prison inside
+```
+
+## Maps
+
+```{r}
+#| label: map-setup
+
+# Census region outlines: state boundaries dissolved by region
+region_map <- tigris::states(cb = TRUE, year = 2020, progress_bar = FALSE) %>%
+  filter(STATEFP %in% unique(puma_geo_l48$state_fips)) %>%
+  left_join(
+    tibble(STUSPS = c(state.abb, "DC"),
+           region = c(as.character(state.region), "South")) %>%
+      mutate(region = recode(region, "North Central" = "Midwest")),
+    by = "STUSPS"
+  ) %>%
+  st_transform(st_crs(puma_geo_l48)) %>%
+  group_by(region) %>%
+  summarise()
+
+# Pieces shared by the maps; add them with "+"
+map_theme    <- list(theme_void(), theme(plot.title = element_text(face = "bold")))
+region_layer <- geom_sf(data = region_map, fill = NA, colour = "black", linewidth = 0.4)
+prison_layer <- geom_sf(data = prisons, size = 0.5, colour = "deepskyblue3", alpha = 0.7)
+```
+
+### Outcomes (add maps by years)
+
+```{r}
+#| label: map-overdose
+ggplot(puma_geo_l48) +
+  geom_sf(aes(fill = overdose_rate_2022_2024), colour = NA) +
+  scale_fill_viridis_c(name = "Per 100,000", option = "magma", direction = -1,
+                       na.value = "grey85") +
+  region_layer +
+  labs(title = "Overdose death rate, 2022–2024") +
+  map_theme
+```
+
+```{r}
+#| label: map-overdose-years
+# One map per year, same colour scale so the years can be compared
+puma_geo_l48 %>%
+  select(GEOID20, overdose_rate_2022, overdose_rate_2023, overdose_rate_2024) %>%
+  pivot_longer(starts_with("overdose_rate_"), names_to = "year", values_to = "rate",
+               names_prefix = "overdose_rate_") %>%
+  ggplot() +
+  geom_sf(aes(fill = rate), colour = NA) +
+  scale_fill_viridis_c(name = "Per 100,000", option = "magma", direction = -1,
+                       na.value = "grey85") +
+  region_layer +
+  facet_wrap(~ year, ncol = 1) +
+  labs(title = "Overdose death rate by year") +
+  map_theme
+```
+
+When we look at the overdose rates for each year separately, we see that 2024 has much lower rates across the whole country (a drop of about 24%). A quick google search confirms this and attributes it to new state policies and access to naloxone (narcan). This makes me wonder whether pooling all these years into one dataset is still okay, and whether I should find a way to also control for access to naloxone or for drug/healthcare policies at the state level(or state fixed effects are enough)?
+
+```{r}
+#| label: map-divorce
+ggplot(puma_geo_l48) +
+  geom_sf(aes(fill = pct_divorced_past_yr), colour = NA) +
+  scale_fill_viridis_c(name = "% of\never-married", option = "magma", direction = -1,
+                       na.value = "grey85") +
+  region_layer +
+  labs(title = "Divorced in the past year, 2022–2024") +
+  map_theme
+```
+
+```{r}
+#| label: map-divorce-years
+#| fig-height: 9
+# One map per year, same colour scale so the years can be compared
+puma_geo_l48 %>%
+  select(GEOID20, pct_divorced_past_yr_2022, pct_divorced_past_yr_2023, pct_divorced_past_yr_2024) %>%
+  pivot_longer(starts_with("pct_divorced_past_yr_20"), names_to = "year", values_to = "rate",
+               names_prefix = "pct_divorced_past_yr_") %>%
+  ggplot() +
+  geom_sf(aes(fill = rate), colour = NA) +
+  scale_fill_viridis_c(name = "% of\never-married", option = "magma", direction = -1,
+                       na.value = "grey85") +
+  region_layer +
+  facet_wrap(~ year, ncol = 1) +
+  labs(title = "Divorced in the past year, by year") +
+  map_theme
+```
+
+The divorce rates seem more stable across the years.
+
+### Prisons and exposure
+
+```{r}
+#| label: map-prisons
+# where the prisons are (open state and federal facilities)
+ggplot() +
+  geom_sf(data = puma_geo_l48, fill = "grey95", colour = "grey80", linewidth = 0.05) +
+  region_layer +
+  geom_sf(data = prisons, aes(colour = TYPE), size = 0.7, alpha = 0.8) +
+  scale_colour_manual(values = c(STATE = "firebrick", FEDERAL = "navy"), name = NULL) +
+  labs(title = "Open state and federal prisons") +
+  map_theme
+```
+
+Exposure at the four decay scales (h=1, h=5, h=10, h=25)
+
+I am still conflicted about which of these four should be “the main measure”... I know for sure that it is not going to be 25 km, because that is too far and does not really make sense. Conceptually, h = 1 and h = 5 make the most sense to me, but because few such places exist, I am wondering whether it makes sense to use them. Also, when running the models, we can see that the effect and its significance fade/weaken as h increases, so maybe I actually need all of them...?
+
+```{r}
+#| label: map-exposure
+exp_h1 <- ggplot(puma_geo_l48) +
+  geom_sf(aes(fill = prison_exp_h1), colour = NA) +
+  scale_fill_viridis_c(name = "Exposure", option = "viridis", trans = "sqrt",
+                       na.value = "grey85") +
+  region_layer +
+  labs(title = "Prison exposure, h = 1 km") +
+  map_theme
+
+exp_h5 <- ggplot(puma_geo_l48) +
+  geom_sf(aes(fill = prison_exp_h5), colour = NA) +
+  scale_fill_viridis_c(name = "Exposure", option = "viridis", trans = "sqrt",
+                       na.value = "grey85") +
+  region_layer +
+  labs(title = "Prison exposure, h = 5 km") +
+  map_theme
+
+exp_h10 <- ggplot(puma_geo_l48) +
+  geom_sf(aes(fill = prison_exp_h10), colour = NA) +
+  scale_fill_viridis_c(name = "Exposure", option = "viridis", trans = "sqrt",
+                       na.value = "grey85") +
+  region_layer +
+  labs(title = "Prison exposure, h = 10 km") +
+  map_theme
+
+exp_h25 <- ggplot(puma_geo_l48) +
+  geom_sf(aes(fill = prison_exp_h25), colour = NA) +
+  scale_fill_viridis_c(name = "Exposure", option = "viridis", trans = "sqrt",
+                       na.value = "grey85") +
+  region_layer +
+  labs(title = "Prison exposure, h = 25 km") +
+  map_theme
+
+(exp_h1 + exp_h5) / (exp_h10 + exp_h25)   
+```
+
+Count-based exposure measures:
+
+```{r}
+#| label: map-prison-presence
+# PUMAs with at least one open state or federal prison inside their boundary
+puma_geo_l48 %>%
+  mutate(presence = if_else(prison_present_in_puma == 1, "Prison in PUMA", "No prison")) %>%
+  ggplot() +
+  geom_sf(aes(fill = presence), colour = "white", linewidth = 0.05) +
+  scale_fill_manual(values = c("Prison in PUMA" = "firebrick", "No prison" = "grey90"),
+                    name = NULL, na.value = "grey85") +
+  region_layer +
+  labs(title = "PUMAs with and without a prison inside their boundary") +
+  map_theme
+```
+
+```{r}
+#| label: map-prison-count
+# Number of open state and federal prisons inside each PUMA
+puma_geo_l48 %>%
+  mutate(n_prisons = cut(num_prisons_in_puma, breaks = c(-Inf, 0, 1, 2, Inf),
+                         labels = c("0", "1", "2", "3+"))) %>%
+  ggplot() +
+  geom_sf(aes(fill = n_prisons), colour = "white", linewidth = 0.05) +
+  scale_fill_manual(values = c("0" = "grey90", "1" = "#fcae91", "2" = "#fb6a4a", "3+" = "#a50f15"),
+                    name = "Prisons", na.value = "grey85") +
+  region_layer +
+  labs(title = "Number of prisons inside each PUMA") +
+  map_theme
+```
+
+From the maps and the test below, it is evident that these two are actually not that different. So I think I should either choose the number of prisons, since it is the more informative measure, or just discuss them as a pair of count-based measures, basically in contrast to the distance-decay group.
+
+### Settlement geography
+
+These are the variables that go into M2 (the model specification, which includes area/population characteristics). 
+
+```{r}
+#| label: map-geography
+ggplot(puma_geo_l48) +
+  geom_sf(aes(fill = log_pop_density), colour = NA) +
+  scale_fill_viridis_c(name = "log density", option = "cividis", na.value = "grey85") +
+  region_layer +
+  labs(title = "Population density (log, people per km²)") +
+  map_theme
+
+ggplot(puma_geo_l48) +
+  geom_sf(aes(fill = pct_pop_rural), colour = NA) +
+  scale_fill_viridis_c(name = "%", option = "cividis", direction = -1, na.value = "grey85") +
+  region_layer +
+  labs(title = "Share of rural population tracts (RUCA 10)") +
+  map_theme
+
+ggplot(puma_geo_l48) +
+  geom_sf(aes(fill = pct_pop_nonmetro), colour = NA) +
+  scale_fill_viridis_c(name = "%", option = "cividis", direction = -1, na.value = "grey85") +
+  region_layer +
+  labs(title = "Share of non-metro population tracts") +
+  map_theme
+```
+
+### Which PUMAs are selected as rural and as non-metro
+
+A PUMA is selected when more than half of its population lives in that
+type of tract.
+
+```{r}
+#| label: map-rural-selection
+puma_geo_l48 %>%
+  mutate(selected = if_else(pct_pop_nonmetro > 50, "Non-metro PUMA", "Not selected")) %>%
+  ggplot() +
+  geom_sf(aes(fill = selected), colour = "white", linewidth = 0.05) +
+  scale_fill_manual(values = c("Non-metro PUMA" = "darkgreen", "Not selected" = "grey90"),
+                    name = NULL, na.value = "grey85") +
+  region_layer +
+  labs(title = "PUMAs with more than 50% of the population in non-metro tracts",
+       subtitle = "Non-metro = RUCA 4–10 (micropolitan, small town and rural)") +
+  map_theme
+
+puma_geo_l48 %>%
+  mutate(selected = if_else(pct_pop_rural > 50, "Rural PUMA", "Not selected")) %>%
+  ggplot() +
+  geom_sf(aes(fill = selected), colour = "white", linewidth = 0.05) +
+  scale_fill_manual(values = c("Rural PUMA" = "darkorange3", "Not selected" = "grey90"),
+                    name = NULL, na.value = "grey85") +
+  region_layer +
+  labs(title = "PUMAs with more than 50% of the population in rural tracts",
+       subtitle = "Rural = RUCA 10 only") +
+  map_theme
+
+```
+
+Based on this definition, we end up with too few fully rural pumas, so I think it makes sense to proceed with the non-metro PUMAs and use the variable pct_pop_nonmetro both in the models and for filtering the rural subset.
+
+## Correlations
+
+Spearman correlations, since most of the exposure measures are very
+skewed.
+
+```{r}
+#| label: correlations
+cor_vars <- c(
+  # Tract-based measures
+  "Exposure h=1"             = "prison_exp_h1",
+  "Exposure h=5"             = "prison_exp_h5",
+  "Exposure h=10"             = "prison_exp_h10",
+  "Exposure h=25"            = "prison_exp_h25",
+  "Prisons in PUMA"           = "num_prisons_in_puma",
+  "Prison in PUMA (0/1)"      = "prison_present_in_puma",
+  # Settlement geography
+  "Log density"               = "log_pop_density",
+  "% rural (RUCA 10)"         = "pct_pop_rural",
+  "% non-metro"               = "pct_pop_nonmetro"
+)
+cor_vars <- cor_vars[cor_vars %in% names(puma_df)]   # skip any that aren't in the data
+
+cor_mat <- puma_df %>%
+  select(all_of(cor_vars)) %>%
+  cor(use = "pairwise.complete.obs", method = "spearman")
+
+# correlation matrix code
+cor_long <- as_tibble(cor_mat, rownames = "var1") %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "rho") %>%
+  mutate(var1 = factor(var1, levels = names(cor_vars)),
+         var2 = factor(var2, levels = rev(names(cor_vars))))
+
+ggplot(cor_long, aes(var1, var2, fill = rho)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", rho)), size = 3) +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b",
+                       midpoint = 0, limits = c(-1, 1), name = "Spearman") +
+  labs(x = NULL, y = NULL, title = "Correlations: exposure measures and settlement geography") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+```
+
+## Group comparisons
+
+This section shows unadjusted comparisons of the outcomes across exposure groups. Prison presence gives two groups, and the number of prisons gives three (0, 1, 2+). Each decay measure is split into an "unexposed" group (exposure below 0.01, meaning no prison anywhere near where people live) and four equal-sized groups of the exposed PUMAs.
+
+```{r}
+#| label: groupings
+puma_groups <- puma_df %>%
+  mutate(
+    # 1. Any prison inside the PUMA
+    grp_presence = factor(if_else(prison_present_in_puma == 1, "Prison in PUMA", "No prison"),
+                          levels = c("No prison", "Prison in PUMA")),
+    # 2. Number of prisons inside the PUMA
+    grp_count = cut(num_prisons_in_puma, breaks = c(-Inf, 0, 1, Inf),
+                    labels = c("0", "1", "2+")),
+    # 3. Distance-decay exposure: "unexposed" (< 0.01), then quartiles of the exposed PUMAs
+    grp_h1  = if_else(prison_exp_h1  < 0.01, "Unexposed",
+                      paste0("Q", ntile(if_else(prison_exp_h1  >= 0.01, prison_exp_h1,  NA_real_), 4))),
+    grp_h5  = if_else(prison_exp_h5  < 0.01, "Unexposed",
+                      paste0("Q", ntile(if_else(prison_exp_h5  >= 0.01, prison_exp_h5,  NA_real_), 4))),
+    grp_h10 = if_else(prison_exp_h10 < 0.01, "Unexposed",
+                      paste0("Q", ntile(if_else(prison_exp_h10 >= 0.01, prison_exp_h10, NA_real_), 4))),
+    grp_h25 = if_else(prison_exp_h25 < 0.01, "Unexposed",
+                      paste0("Q", ntile(if_else(prison_exp_h25 >= 0.01, prison_exp_h25, NA_real_), 4))),
+    across(c(grp_h1, grp_h5, grp_h10, grp_h25),
+           ~ factor(.x, levels = c("Unexposed", "Q1", "Q2", "Q3", "Q4"))),
+    # For the stratified comparison
+    metro = factor(if_else(pct_pop_nonmetro > 50, "Non-metro PUMAs", "Metro PUMAs"))
+  )
+
+groupings <- c(
+  grp_presence = "Prison inside the PUMA",
+  grp_count    = "Number of prisons inside the PUMA",
+  grp_h1       = "Decay exposure, h = 1 km",
+  grp_h5       = "Decay exposure, h = 5 km",
+  grp_h10      = "Decay exposure, h = 10 km",
+  grp_h25      = "Decay exposure, h = 25 km"
+)
+
+# How many PUMAs in each group
+puma_groups %>% count(grp_presence)
+puma_groups %>% count(grp_count)
+puma_groups %>% count(grp_h1)
+puma_groups %>% count(grp_h5)
+puma_groups %>% count(grp_h10)
+puma_groups %>% count(grp_h25)
+```
+
+Mean, median and SD of each outcome in each group:
+
+```{r}
+#| label: group-means
+# All group labels, in display order
+group_levels <- c("No prison", "Prison in PUMA", "0", "1", "2+",
+                  "Unexposed", "Q1", "Q2", "Q3", "Q4")
+
+# Long format: one row per PUMA x outcome x grouping
+group_long <- puma_groups %>%
+  select(GEOID20, all_of(names(outcomes)), all_of(names(groupings))) %>%
+  pivot_longer(all_of(names(outcomes)), names_to = "y", values_to = "value") %>%
+  pivot_longer(all_of(names(groupings)), names_to = "g", values_to = "group",
+               values_transform = as.character) %>%
+  filter(!is.na(value), !is.na(group)) %>%
+  mutate(group = factor(group, levels = group_levels))
+
+group_stats <- group_long %>%
+  group_by(y, g, group) %>%
+  summarise(n = n(), mean = mean(value), median = median(value), sd = sd(value),
+            .groups = "drop") %>%
+  mutate(outcome  = outcomes[y],
+         grouping = factor(groupings[g], levels = groupings))
+
+group_stats %>%
+  select(outcome, grouping, group, n, mean, median, sd) %>%
+  arrange(outcome, grouping, group) %>%
+  gt(groupname_col = c("outcome", "grouping")) %>%
+  fmt_number(columns = c(mean, median, sd), decimals = 2) %>%
+  tab_header(title = "Outcomes by prison exposure group")
+```
+
+The differences in means actually look promising! Pumas with prisons show higher mean rates of both overdose and divorce than Pumas without prisons. In addition, the distance-decay measures show that as exposure increases, the means for both overdose and divorce also increase.
+
+```{r}
+#| label: group-tests
+# Two groups (prison in PUMA vs not): Welch t-test and Wilcoxon rank-sum test
+tests_presence <- group_long %>%
+  filter(g == "grp_presence") %>%
+  group_by(y, g) %>%
+  summarise(
+    test_means = "Welch t-test",
+    difference = diff(t.test(value ~ droplevels(group))$estimate),   # prison minus no prison
+    p_means    = t.test(value ~ droplevels(group))$p.value,
+    test_ranks = "Wilcoxon",
+    p_ranks    = wilcox.test(value ~ droplevels(group))$p.value,
+    p_trend    = NA_real_,
+    .groups = "drop"
+  )
+
+# More than two ordered groups (count and all decay measures):
+# ANOVA, Kruskal-Wallis and a linear trend test across the ordered groups
+tests_ordered <- group_long %>%
+  filter(g != "grp_presence") %>%
+  group_by(y, g) %>%
+  summarise(
+    test_means = "ANOVA",
+    difference = NA_real_,
+    p_means    = anova(lm(value ~ droplevels(group)))$`Pr(>F)`[1],
+    test_ranks = "Kruskal-Wallis",
+    p_ranks    = kruskal.test(value ~ droplevels(group))$p.value,
+    p_trend    = tidy(lm(value ~ as.integer(droplevels(group))))$p.value[2],   # groups as 1, 2, 3, ...
+    .groups = "drop"
+  )
+
+test_results <- bind_rows(tests_presence, tests_ordered) %>%
+  mutate(outcome  = outcomes[y],
+         grouping = factor(groupings[g], levels = groupings)) %>%
+  arrange(outcome, grouping) %>%
+  select(outcome, grouping, test_means, difference, p_means, test_ranks, p_ranks, p_trend)
+
+test_results %>%
+  gt(groupname_col = "outcome") %>%
+  fmt_number(columns = difference, decimals = 2) %>%
+  fmt_number(columns = c(p_means, p_ranks, p_trend), decimals = 4) %>%
+  sub_missing(missing_text = "") %>%
+  cols_label(grouping = "Grouping", test_means = "Means test", difference = "Difference",
+             p_means = "p (means)", test_ranks = "Rank test", p_ranks = "p (ranks)",
+             p_trend = "p (linear trend)") %>%
+  tab_header(title = "Do outcomes differ by prison exposure? (unadjusted)",
+subtitle = "Difference = with prison minus without (two-group comparisons only)")
+```
+
+These tests check whether the outcomes differ across groups. For the two-group comparison (prison vs. no prison), we used a Welch t-test for the means and a Wilcoxon rank-sum test for the whole distributions. For the groupings with more than two groups, we used ANOVA and Kruskal-Wallis, plus a linear trend test across the ordered groups. These tests ignore the controls and assume that PUMAs are independent (they are not), so they are descriptive only.
+
+### Within metro and non-metro PUMAs
+
+The same prison vs. no prison comparison, separately for metro and
+non-metro PUMAs. 
+
+```{r}
+#| label: group-stratified
+# Prison vs. no prison, separately in metro and non-metro PUMAs.
+# Welch t-test (means) and Wilcoxon rank-sum test (distributions), as in the main comparison.
+stratified <- puma_groups %>%
+  pivot_longer(all_of(names(outcomes)), names_to = "y", values_to = "value") %>%
+  filter(!is.na(value), !is.na(grp_presence)) %>%
+  group_by(y, metro) %>%
+  summarise(
+    n_no_prison    = sum(grp_presence == "No prison"),
+    n_prison       = sum(grp_presence == "Prison in PUMA"),
+    mean_no_prison = t.test(value ~ grp_presence)$estimate[[1]],
+    mean_prison    = t.test(value ~ grp_presence)$estimate[[2]],
+    difference     = mean_prison - mean_no_prison,              # prison minus no prison
+    p_means        = t.test(value ~ grp_presence)$p.value,
+    p_ranks        = wilcox.test(value ~ grp_presence)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(outcome = outcomes[y])
+
+stratified %>%
+  select(outcome, metro, n_no_prison, n_prison, mean_no_prison, mean_prison,
+         difference, p_means, p_ranks) %>%
+  arrange(outcome, metro) %>%
+  gt(groupname_col = "outcome") %>%
+  fmt_number(columns = c(mean_no_prison, mean_prison, difference), decimals = 2) %>%
+  fmt_number(columns = c(p_means, p_ranks), decimals = 4) %>%
+  cols_label(metro = "PUMAs", n_no_prison = "n (no prison)", n_prison = "n (prison)",
+             mean_no_prison = "Mean (no prison)", mean_prison = "Mean (prison)",
+             difference = "Difference", p_means = "p (t-test)", p_ranks = "p (Wilcoxon)") %>%
+  tab_header(title = "Prison vs. no prison, within metro and non-metro PUMAs (unadjusted)")
+```
+
+I think this is actually interesting, but unfortunately it contradicts my initial theory. First of all, there are more prisons in urban/metropolitan areas (which makes sense given the way we define metro/non-metro). However, what is more important is that the means are actually lower (for overdose) or not significantly different (for divorce) in the rural PUMAs with prisons.
+
+# OLS MODELS
+
+Each model has one exposure measure. Controls are added in stages so we can see how much the exposure coefficient moves at each step. Standard errors for all of the models are clustered by state
+
+| Model | Adds |
+|-----------------|-------------------------------------------------------|
+| M1 | nothing (exposure only) |
+| M2 | settlement geography: log density, % non-metro, log population |
+| M3a | M2 + economic: % unemployed, log median income |
+| M3b | M2 + education: % bachelor's or more |
+| M3c | M2 + race: % non-White |
+| M3d | M2 + all of the above |
+| M3 | M3d + state fixed effects|
+| M3-div | M3d + Census division fixed effects |
+
+## Setup and fitting
+
+```{r}
+#| label: p4-setup
+
+# Census division for each state (base R state lists; DC added by hand)
+state_lookup <- tibble(state = state.abb,
+                       division = as.character(state.division)) %>%
+  add_row(state = "DC", division = "South Atlantic") %>%
+  left_join(distinct(tidycensus::fips_codes, state, state_code), by = "state") %>%
+  select(state_fips = state_code, division)
+
+# Exposure measures: variable -> label
+exposures <- c(
+  prison_exp_h1          = "Exposure, h = 1 km",
+  prison_exp_h5          = "Exposure, h = 5 km",
+  prison_exp_h10         = "Exposure, h = 10 km",
+  prison_exp_h25         = "Exposure, h = 25 km",
+  num_prisons_in_puma    = "Number of prisons in PUMA",
+  prison_present_in_puma = "Prison in PUMA (0/1)"
+)
+
+# Control groups
+ctrl_geo  <- c("log_pop_density", "pct_pop_nonmetro", "log_pop")
+ctrl_econ <- c("pct_unemployed", "log_medhhinc")
+ctrl_educ <- c("pct_bachelors_plus")
+ctrl_race <- c("pct_nonwhite")
+ctrl_religion <-c("pct_religious")
+ctrl_all  <- c(ctrl_geo, ctrl_econ, ctrl_educ, ctrl_race)
+ctrl_all_div  <- c(ctrl_geo, ctrl_econ, ctrl_educ, ctrl_race, ctrl_religion)
+
+# Model specifications: one row per stage, with its controls and fixed effects
+specs_od <- tibble(
+  spec     = c("M1", "M2", "M3a", "M3b", "M3c", "M3d", "M3", "M3-div"),
+  controls = list(character(0), ctrl_geo, c(ctrl_geo, ctrl_econ), c(ctrl_geo, ctrl_educ),
+                  c(ctrl_geo, ctrl_race), ctrl_all, ctrl_all, ctrl_all),
+  fe       = c(NA, NA, NA, NA, NA, NA, "state_fips", "division")
+)
+
+specs_div <- tibble(
+  spec     = c("M1", "M2", "M3a", "M3b", "M3c", "M3d", "M3", "M3-div"),
+  controls = list(character(0), ctrl_geo, c(ctrl_geo, ctrl_econ), c(ctrl_geo, ctrl_educ),
+                  c(ctrl_geo, ctrl_race), ctrl_all_div, ctrl_all_div, ctrl_all_div),
+  fe       = c(NA, NA, NA, NA, NA, NA, "state_fips", "division")
+)
+
+# Both together, with the outcome each set of specs belongs to
+specs <- bind_rows(
+  specs_od  %>% mutate(y = "overdose_rate_2022_2024"),
+  specs_div %>% mutate(y = "pct_divorced_past_yr")
+)
+
+# Model data: add division and log distance; standardize continuous exposures
+puma_m <- puma_df %>%
+  left_join(state_lookup, by = "state_fips") %>%
+  mutate(log_dist_nearest = log(dist_nearest_prison_km_popw),
+         across(all_of(setdiff(names(exposures), "prison_present_in_puma")),
+                ~ (.x - mean(.x, na.rm = TRUE)) / sd(.x, na.rm = TRUE)))
+
+# One complete-case sample per outcome, using that outcome's own full control set
+# (same PUMAs in every model for that outcome)
+model_data <- list(
+  overdose_rate_2022_2024 = puma_m %>%
+    drop_na(all_of(c("overdose_rate_2022_2024", names(exposures), ctrl_all,
+                     "state_fips", "division"))),
+  pct_divorced_past_yr = puma_m %>%
+    drop_na(all_of(c("pct_divorced_past_yr", names(exposures), ctrl_all_div,
+                     "state_fips", "division")))
+)
+
+map_int(model_data, nrow)   # PUMAs per outcome
+```
+
+```{r}
+#| label: p4-fit
+# Every outcome x specification (its own specs) x exposure, with its formula written out
+all_models <- specs %>%
+  expand_grid(x = names(exposures)) %>%
+  mutate(
+    rhs     = map2_chr(x, controls, ~ str_c(c(.x, .y), collapse = " + ")),
+    formula = str_c(y, " ~ ", rhs, if_else(is.na(fe), "", str_c(" | ", fe))),
+    model   = map2(formula, y, ~ feols(as.formula(.x), data = model_data[[.y]],
+                                       cluster = ~state_fips))
+  )
+
+all_models %>% distinct(y, spec, formula)   # check: the divorce M3d/M3/M3-div should include the extra controls
+
+# Pull out the exposure coefficient from each model
+results <- all_models %>%
+  mutate(
+    coef = map2(model, x, ~ tidy(.x, conf.int = TRUE) %>%
+                              filter(term == .y) %>%
+                              select(estimate, std.error, p.value, conf.low, conf.high)),
+    r2 = map_dbl(model, ~ r2(.x, "r2")),
+    n  = map_int(model, nobs)
+  ) %>%
+  select(y, x, spec, coef, r2, n) %>%
+  unnest(coef) %>%
+    mutate(spec = factor(spec, levels = specs_od$spec)) %>%
+  group_by(y, x) %>%
+  arrange(spec, .by_group = TRUE) %>%
+  mutate(pct_change_from_M1 = 100 * (estimate - first(estimate)) / abs(first(estimate))) %>%
+  ungroup() %>%
+  mutate(outcome  = outcomes[y],
+         exposure = factor(exposures[x], levels = exposures))
+```
+
+## All stages, by exposure
+
+Each table is one exposure measure across all model stages, so we can see how β, its standard error and R² change as controls are added.
+
+### Overdose deaths per 100,000
+
+h = 1 km:
+
+Positive association between the overdose rate and prison_exp_h1, significant under all specifications.
+
+```{r}
+#| label: p4-staged-overdose
+models_od <- all_models %>%
+  filter(y == "overdose_rate_2022_2024", x == "prison_exp_h1") %>%
+  pull(model) %>%
+  set_names(specs_od$spec)
+
+etable(models_od, fitstat = ~ r2 + n, digits = 3)
+```
+
+h = 5 km:
+
+Positive association between the overdose rate and prison_exp_h5, NOT significant under any specification.
+
+```{r}
+#| label: p4-staged-overdose-h5
+models_od <- all_models %>%
+  filter(y == "overdose_rate_2022_2024", x == "prison_exp_h5") %>%
+  pull(model) %>%
+  set_names(specs_od$spec)
+
+etable(models_od, fitstat = ~ r2 + n, digits = 3)
+```
+
+h = 10 km:
+
+Positive association between the overdose rate and prison_exp_h10, NOT significant under any specification.
+
+```{r}
+#| label: p4-staged-overdose-h10
+models_od <- all_models %>%
+  filter(y == "overdose_rate_2022_2024", x == "prison_exp_h10") %>%
+  pull(model) %>%
+  set_names(specs_od$spec)
+
+etable(models_od, fitstat = ~ r2 + n, digits = 3)
+```
+
+Number of prisons in the PUMA:
+
+Positive association between the overdose rate and num_prisons_in_puma, NOT significant under full specifications.
+
+```{r}
+#| label: p4-staged-overdose-count
+models_od <- all_models %>%
+  filter(y == "overdose_rate_2022_2024", x == "num_prisons_in_puma") %>%
+  pull(model) %>%
+  set_names(specs_od$spec)
+
+etable(models_od, fitstat = ~ r2 + n, digits = 3)
+```
+
+Any prison in the PUMA:
+
+Positive association between the overdose rate and prison_present_in_puma, significant under all specifications.
+
+```{r}
+#| label: p4-staged-overdose-presence
+models_od <- all_models %>%
+  filter(y == "overdose_rate_2022_2024", x == "prison_present_in_puma") %>%
+  pull(model) %>%
+  set_names(specs_od$spec)
+
+etable(models_od, fitstat = ~ r2 + n, digits = 3)
+
+```
+
+### % of ever-married divorced in the past year
+
+From M3d on, the divorce models also control for religious adherence
+(`pct_religious`).
+
+h = 1 km:
+
+Positive association between the divorce rate and prison_exp_h1, significant under all specifications.
+
+```{r}
+#| label: p4-staged-divorce
+models_div <- all_models %>%
+  filter(y == "pct_divorced_past_yr", x == "prison_exp_h1") %>%
+  pull(model) %>%
+  set_names(specs_div$spec)
+
+etable(models_div, fitstat = ~ r2 + n, digits = 3)
+```
+
+h = 5 km:
+
+Positive association between the divorce rate and prison_exp_h5, significant under all specifications.
+
+```{r}
+#| label: p4-staged-divorce-h5
+models_div <- all_models %>%
+  filter(y == "pct_divorced_past_yr", x == "prison_exp_h5") %>%
+  pull(model) %>%
+  set_names(specs_div$spec)
+
+etable(models_div, fitstat = ~ r2 + n, digits = 3)
+```
+
+h = 10 km:
+
+Positive association between the divorce rate and prison_exp_h10, significant under all specifications.
+
+```{r}
+#| label: p4-staged-divorce-h10
+models_div <- all_models %>%
+  filter(y == "pct_divorced_past_yr", x == "prison_exp_h10") %>%
+  pull(model) %>%
+  set_names(specs_div$spec)
+
+etable(models_div, fitstat = ~ r2 + n, digits = 3)
+```
+
+h = 25 km:
+
+Positive association between the divorce rate and prison_exp_h25, significant only with state and division fixed effects.
+
+```{r}
+#| label: p4-staged-divorce-h25
+models_div <- all_models %>%
+  filter(y == "pct_divorced_past_yr", x == "prison_exp_h25") %>%
+  pull(model) %>%
+  set_names(specs_div$spec)
+
+etable(models_div, fitstat = ~ r2 + n, digits = 3)
+```
+
+Number of prisons in the PUMA:
+
+Positive association between the divorce rate and num_prisons_in_pum, significant only with division fixed effects.
+
+```{r}
+#| label: p4-staged-divorce-count
+models_div <- all_models %>%
+  filter(y == "pct_divorced_past_yr", x == "num_prisons_in_puma") %>%
+  pull(model) %>%
+  set_names(specs_div$spec)
+
+etable(models_div, fitstat = ~ r2 + n, digits = 3)
+```
+
+Any prison in the PUMA:
+
+Positive association between the divorce rate and prison_present_in_puma, significant under all specifications.
+
+```{r}
+#| label: p4-staged-divorce-presence
+models_div <- all_models %>%
+  filter(y == "pct_divorced_past_yr", x == "prison_present_in_puma") %>%
+  pull(model) %>%
+  set_names(specs_div$spec)
+
+etable(models_div, fitstat = ~ r2 + n, digits = 3)
+```
+
+## All exposure measures
+
+`% change` is relative to M1. It’s misleading when β is negative (a more negative β shows up as a negative change), so read it together with β.
+
+```{r}
+#| label: p4-summary-table
+results %>%
+  filter(spec %in% c("M1", "M2", "M3d", "M3", "M3-div")) %>%
+  select(outcome, exposure, spec, estimate, std.error, p.value, pct_change_from_M1, r2) %>%
+  arrange(outcome, exposure, spec) %>%
+  gt(groupname_col = c("outcome", "exposure")) %>%
+  fmt_number(columns = c(estimate, std.error, r2), decimals = 3) %>%
+  fmt_number(columns = p.value, decimals = 4) %>%
+  fmt_number(columns = pct_change_from_M1, decimals = 0) %>%
+  sub_missing(missing_text = "") %>%
+  cols_label(spec = "Model", estimate = "β", std.error = "SE (state)", p.value = "p",
+             pct_change_from_M1 = "% change vs M1", r2 = "R²") %>%
+  tab_style(style = cell_fill(color = "#fff3cd"), locations = cells_body(rows = p.value < 0.05)) %>%
+  tab_header(title = "Prison exposure coefficient across model stages",
+             subtitle = "Continuous exposures per SD; presence = with vs. without; SEs clustered by state. Shaded: p < 0.05")
+```
+
+OLS shows an effect on the divorce rate, which seems to be stronger at lower h. The effect of prisons on overdose is only significant with the distance-decay measure at h = 1 and with both count-based measures.
+
+## Which control group moves β
+
+```{r}
+#| label: p4-control-groups
+results %>%
+  filter(spec %in% c("M2", "M3a", "M3b", "M3c", "M3d", "M3", "M3-div")) %>%
+  select(outcome, exposure, spec, estimate) %>%
+  pivot_wider(names_from = spec, values_from = estimate) %>%
+  arrange(outcome, exposure) %>%
+  gt(groupname_col = "outcome") %>%
+  fmt_number(columns = -c(outcome, exposure), decimals = 3) %>%
+  cols_label(M3a = "M2 + economic", M3b = "M2 + education", M3c = "M2 + race",
+             M3d = "M2 + all", M3 = "+ state FE", `M3-div` = "+ division FE") %>%
+  tab_header(title = "Exposure coefficient (β) as each control group is added")
+```
+
+```{r}
+#| label: p4-coefplot
+#| fig-height: 8
+results %>%
+  filter(spec %in% c("M1", "M2", "M3d", "M3", "M3-div")) %>%
+  ggplot(aes(x = estimate, y = fct_rev(exposure), colour = spec)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high),
+                  position = position_dodge(width = 0.7), size = 0.3) +
+  facet_wrap(~ outcome, scales = "free_x") +
+  scale_colour_brewer(palette = "Dark2", name = "Model") +
+  labs(x = "β with 95% CI (SEs clustered by state)", y = NULL,
+       title = "Prison exposure coefficients across model stages") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+# SPATIAL DIAGNOSTICS 
+
+OLS assumes that PUMAs are independent of each other. But if neighboring pumas have similar residuals, this assumption doesn’t hold: the standard errors are wrong, and the model is missing something regional. Here we check this for M3 (all controls + state fixed effects) with all six exposure measures. 
+
+The neighbors are defined in two ways, to see if the choice matters:
+
+Queen contiguity: PUMAs that share a border or a corner. Two PUMAs (islands) have no neighbors.
+6 nearest neighbors: every PUMA gets six neighbors, no matter its size.
+
+```{r}
+#| label: spatial-setup
+
+spatial_exposures <- exposures  
+
+# Model data with boundaries, one per outcome
+# Rows stay in this order for the models, the weights, and the maps.
+geo_data <- map(names(outcomes),
+                ~ puma_geo %>%
+                    select(GEOID20) %>%
+                    st_transform(5070) %>%
+                    inner_join(model_data[[.x]], by = "GEOID20")) %>%
+  set_names(names(outcomes))
+
+# Queen contiguity: PUMAs that share a border or corner are neighbors
+# (snap = 1 m bridges tiny gaps between cartographic boundaries)
+queen_nb <- map(geo_data, ~ poly2nb(.x, queen = TRUE, snap = 1))
+
+# 6 nearest neighbors, measured from a point inside each PUMA
+knn_nb <- map(geo_data, ~ .x %>%
+                            st_geometry() %>%
+                            st_point_on_surface() %>%
+                            st_coordinates() %>%
+                            knearneigh(k = 6) %>%
+                            knn2nb())
+
+# Row-standardized weights, stored as weights[[outcome]]$queen / $knn
+weights <- map2(queen_nb, knn_nb,
+                ~ list(queen    = nb2listw(.x, style = "W", zero.policy = TRUE),
+                       knn      = nb2listw(.y, style = "W"),
+                       queen_nb = .x))
+
+```
+
+```{r}
+#| label: p5-models
+# M3 for each outcome and exposure, refitted with lm() so the spatial tests can use it.
+# The formulas come from Phase 4 (so each outcome keeps its own controls);
+# only the fixed effects are written as state dummies, which lm() needs.
+p5_models <- all_models %>%
+  filter(spec == "M3", x %in% names(spatial_exposures)) %>%
+  mutate(formula_lm = str_replace(formula, " \\| state_fips", " + factor(state_fips)"),
+         model      = map2(formula_lm, y,
+                           ~ lm(as.formula(.x), data = st_drop_geometry(geo_data[[.y]])))) %>%
+  select(y, x, formula_lm, model)
+
+# Sanity check: the exposure coefficients match the Phase 4 feols M3 results
+p5_models %>%
+  mutate(estimate_lm = map2_dbl(model, x, ~ coef(.x)[[.y]])) %>%
+  left_join(results %>% filter(spec == "M3") %>% select(y, x, estimate_feols = estimate),
+            by = c("y", "x")) %>%
+  select(y, x, estimate_lm, estimate_feols)
+```
+
+## Moran's I on the outcome and on the residuals
+
+```{r}
+#| label: p5-moran
+# Clustering of the outcome itself
+moran_results <- expand_grid(y = names(outcomes), w = c("queen", "knn")) %>%
+  mutate(
+    outcome_test = map2(y, w, ~ moran.test(geo_data[[.x]][[.x]], weights[[.x]][[.y]],
+                                           zero.policy = TRUE)),
+    outcome_I = map_dbl(outcome_test, ~ unname(.x$estimate[1])),
+    outcome_p = map_dbl(outcome_test, ~ .x$p.value)
+  ) %>%
+  select(-outcome_test)
+
+# Clustering of what the M3 model leaves unexplained
+residual_moran <- p5_models %>%
+  expand_grid(w = c("queen", "knn")) %>%
+  mutate(
+    lw         = map2(y, w, ~ weights[[.x]][[.y]]),
+    test       = map2(model, lw, ~ lm.morantest(.x, .y, zero.policy = TRUE)),
+    residual_I = map_dbl(test, ~ unname(.x$estimate[1])),
+    residual_p = map_dbl(test, ~ .x$p.value)
+  ) %>%
+  select(y, x, w, residual_I, residual_p)
+
+residual_moran %>%
+  left_join(moran_results, by = c("y", "w")) %>%
+  mutate(outcome  = outcomes[y],
+         exposure = spatial_exposures[x],
+         weights  = if_else(w == "queen", "Queen contiguity", "6 nearest neighbors")) %>%
+  select(outcome, weights, exposure, outcome_I, residual_I, residual_p) %>%
+  arrange(outcome, weights) %>%
+  gt(groupname_col = c("outcome", "weights")) %>%
+  fmt_number(columns = c(outcome_I, residual_I), decimals = 3) %>%
+  fmt_number(columns = residual_p, decimals = 4) %>%
+  cols_label(exposure = "Model (M3) with", outcome_I = "Moran's I: outcome",
+             residual_I = "Moran's I: M3 residuals", residual_p = "p (residuals)") %>%
+  tab_header(title = "Spatial clustering before and after the model")
+```
+
+Based on Moran’s I, overdose rates are strongly clustered, both for the outcome itself and for the residuals. This clustering might be real, but given the way the puma overdose rates were produced, it may partly be an artifact of the data. This is also supported by Moran’s I for suicide rates, which also come from the CDC and show even stronger clustering. This suggests that the way the data are constructed may produce artificial clustering.
+
+## Residual maps
+
+Where M3 over- and under-predicts:
+
+```{r}
+#| label: p5-residual-maps
+#| fig-height: 9
+# The M3 model (h = 1 km) for each outcome
+m_od  <- p5_models %>% filter(y == "overdose_rate_2022_2024", x == "prison_exp_h1") %>% pull(model) %>% first()
+m_div <- p5_models %>% filter(y == "pct_divorced_past_yr",    x == "prison_exp_h1") %>% pull(model) %>% first()
+
+# Overdose: residual for each PUMA, capped at the 98th percentile so a few extreme PUMAs
+# don't wash out the colours
+resid_map_od <- geo_data$overdose_rate_2022_2024 %>%
+  mutate(resid = residuals(m_od),
+         lim   = quantile(abs(resid), 0.98),
+         resid_capped = case_when(resid >  lim ~  lim,
+                                  resid < -lim ~ -lim,
+                                  TRUE         ~ resid)) %>%
+  filter(!state_fips %in% c("02", "15")) %>%            # lower 48 only
+  ggplot() +
+  geom_sf(aes(fill = resid_capped), colour = NA) +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b",
+                       midpoint = 0, name = "Residual") +
+  labs(title = "M3 residuals: Overdose deaths per 100,000",
+       subtitle = "Red = higher than predicted, blue = lower (h = 1 km model)") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold"))
+
+# Divorce: same steps
+resid_map_div <- geo_data$pct_divorced_past_yr %>%
+  mutate(resid = residuals(m_div),
+         lim   = quantile(abs(resid), 0.98),
+         resid_capped = case_when(resid >  lim ~  lim,
+                                  resid < -lim ~ -lim,
+                                  TRUE         ~ resid)) %>%
+  filter(!state_fips %in% c("02", "15")) %>%
+  ggplot() +
+  geom_sf(aes(fill = resid_capped), colour = NA) +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b",
+                       midpoint = 0, name = "Residual") +
+  labs(title = "M3 residuals: % of ever-married divorced in the past year",
+       subtitle = "Red = higher than predicted, blue = lower (h = 1 km model)") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold"))
+
+resid_map_od / resid_map_div   
+```
+
+
+# SPATIAL MODELS
+
+| Model | Assumes | Role here |
+|-----------------|---------------------------------------|-----------------|
+| SEM | nearby PUMAs share unmeasured conditions, so their errors are correlated | main spatial model |
+| SDEM | SEM + exposure in neighboring PUMAs can matter too | do prisons just outside a PUMA matter? |
+
+
+Both keep the full M3 specification (each outcome with its own controls). They're estimated by maximum likelihood, so the standard errors are model-based, not clustered.
+
+## Setup
+
+The spatial models need neighbor relations to go both ways, so the kNN weights were made symmetric: two pumas are neighbors if either one is among the other’s 6 nearest. Because of this, some PUMAs end up with a few more than six neighbors.
+
+```{r}
+#| label: p6-setup
+
+weight_labels <- c(queen = "Queen", knn = "kNN (k = 6)")
+
+# Weights for the spatial models. kNN is made symmetric (neighbors if either PUMA is among
+# the other's 6 nearest), which the exact eigenvalue method requires. Queen is already symmetric.
+p6_weights <- map(weights, ~ list(queen = .x$queen,
+                                  knn   = nb2listw(make.sym.nb(.x$knn$neighbours), style = "W")))
+
+# Eigenvalues of each weights matrix, computed once and reused by every model.
+# similar.listw() gives an equivalent symmetric matrix, so the eigenvalues are real.
+p6_eig <- map(p6_weights, ~ list(queen = eigenw(similar.listw(.x$queen)),
+                                 knn   = eigenw(similar.listw(.x$knn))))
+```
+
+## SEM and SDEM, all exposure measures
+
+```{r}
+#| label: p6-fit-error-models
+# Slow (2 outcomes x 6 exposures x 2 weight matrices x 2 models), so this is run by hand
+# once and the fitted models are saved; the next chunk reads them.
+# Formulas: the M3 formulas from Phase 5 (each outcome keeps its own controls).
+# "eigen" computes exact standard errors from the precomputed eigenvalues.
+#p5_models %>%
+#  select(y, x, formula_lm) %>%
+#  expand_grid(w = names(weight_labels)) %>%
+#  mutate(
+#    sem  = pmap(list(formula_lm, y, w),
+#                ~ errorsarlm(as.formula(..1), data = st_drop_geometry(geo_data[[..2]]),
+#                             listw = p6_weights[[..2]][[..3]], method = "eigen",
+#                             control = list(pre_eig = p6_eig[[..2]][[..3]]),
+#                             zero.policy = TRUE),
+#                .progress = "SEM"),
+#    sdem = pmap(list(formula_lm, y, w, x),
+#                ~ errorsarlm(as.formula(..1), data = st_drop_geometry(geo_data[[..2]]),
+#                             listw = p6_weights[[..2]][[..3]],
+#                             Durbin = as.formula(paste("~", ..4)),   # lag only the exposure
+#                             method = "eigen",
+#                             control = list(pre_eig = p6_eig[[..2]][[..3]]),
+#                             zero.policy = TRUE),
+#                .progress = "SDEM")
+#  ) %>%
+#  saveRDS("data/final/p6_error_models.rds")
+```
+
+```{r}
+#| label: p6-load-error-models
+error_models <- readRDS("data/final/p6_error_models.rds")
+```
+
+```{r}
+#| label: p6-extract-error-models
+error_results <- error_models %>%
+  mutate(
+    # SEM: the exposure coefficient
+    sem_coef = map2(sem, x, ~ as_tibble(summary(.x)$Coef, rownames = "term") %>%
+                               filter(term == .y) %>%
+                               transmute(estimate = Estimate, std.error = `Std. Error`,
+                                         p.value = `Pr(>|z|)`)),
+    sem_lambda = map_dbl(sem, ~ .x$lambda),
+    sem_aic    = map_dbl(sem, AIC),
+
+    # SDEM direct: exposure in the PUMA itself
+    sdem_direct = map2(sdem, x, ~ as_tibble(summary(.x)$Coef, rownames = "term") %>%
+                                   filter(term == .y) %>%
+                                   transmute(estimate = Estimate, std.error = `Std. Error`,
+                                             p.value = `Pr(>|z|)`)),
+    # SDEM indirect: exposure in neighboring PUMAs (the "lag." term)
+    sdem_indirect = map2(sdem, x, ~ as_tibble(summary(.x)$Coef, rownames = "term") %>%
+                                     filter(term == paste0("lag.", .y)) %>%
+                                     transmute(estimate = Estimate, std.error = `Std. Error`,
+                                               p.value = `Pr(>|z|)`)),
+    # SDEM total = direct + indirect; its SE uses the covariance between the two
+    sdem_total = map2(sdem, x, ~ tibble(
+                   estimate  = sum(coef(.x)[c(.y, paste0("lag.", .y))]),
+                   std.error = sqrt(sum(vcov(.x)[c(.y, paste0("lag.", .y)),
+                                                 c(.y, paste0("lag.", .y))]))) %>%
+                   mutate(p.value = 2 * pnorm(-abs(estimate / std.error)))),
+    sdem_lambda = map_dbl(sdem, ~ .x$lambda),
+    sdem_aic    = map_dbl(sdem, AIC)
+  ) %>%
+  select(-sem, -sdem)
+
+# OLS M3 (state-clustered) from Phase 4, for comparison
+ols_m3 <- results %>%
+  filter(spec == "M3") %>%
+  select(y, x, ols_estimate = estimate, ols_se = std.error, ols_p = p.value)
+```
+
+
+## One exposure in detail: OLS vs. SEM vs. SDEM
+
+Set `main_x` at the top of the chunk to choose the exposure. It's also used by the model checks below.
+
+```{r}
+#| label: p6-main-table
+# One comparison table: OLS M3 vs. SEM vs. SDEM for the main exposure,
+# for each outcome and weights matrix
+
+#specify the variable you want to look at
+#options: prison_exp_h1, prison_exp_h5, prison_exp_h10, prison_exp_h25, num_prisons_in_puma, prison_present_in_puma
+
+main_x <- "prison_exp_h1"
+
+main_table <- bind_rows(
+  # OLS M3 doesn't use the weights, so the same row is repeated for both weights matrices
+  ols_m3 %>%
+    filter(x == main_x) %>%
+    expand_grid(w = names(weight_labels)) %>%
+    transmute(y, w, model = "OLS M3 (state-clustered SEs)", effect = "Coefficient",
+              estimate = ols_estimate, std.error = ols_se, p.value = ols_p,
+              spatial_param = NA_real_, aic = NA_real_),
+
+  # SEM: exposure coefficient, with lambda and AIC
+  error_results %>%
+    filter(x == main_x) %>%
+    select(y, w, sem_coef, sem_lambda, sem_aic) %>%
+    unnest(sem_coef) %>%
+    transmute(y, w, model = "SEM", effect = "Coefficient",
+              estimate, std.error, p.value,
+              spatial_param = sem_lambda, aic = sem_aic),
+
+  # SDEM direct: exposure in the PUMA itself (lambda and AIC shown on this row)
+  error_results %>%
+    filter(x == main_x) %>%
+    select(y, w, sdem_direct, sdem_lambda, sdem_aic) %>%
+    unnest(sdem_direct) %>%
+    transmute(y, w, model = "SDEM", effect = "Direct",
+              estimate, std.error, p.value,
+              spatial_param = sdem_lambda, aic = sdem_aic),
+
+  # SDEM indirect: exposure in neighboring PUMAs
+  error_results %>%
+    filter(x == main_x) %>%
+    select(y, w, sdem_indirect) %>%
+    unnest(sdem_indirect) %>%
+    transmute(y, w, model = "SDEM", effect = "Indirect (neighbors)",
+              estimate, std.error, p.value,
+              spatial_param = NA_real_, aic = NA_real_),
+
+  # SDEM total: direct + indirect
+  error_results %>%
+    filter(x == main_x) %>%
+    select(y, w, sdem_total) %>%
+    unnest(sdem_total) %>%
+    transmute(y, w, model = "SDEM", effect = "Total",
+              estimate, std.error, p.value,
+              spatial_param = NA_real_, aic = NA_real_)
+) %>%
+  mutate(outcome = outcomes[y],
+         weights = weight_labels[w],
+         model   = factor(model, levels = c("OLS M3 (state-clustered SEs)", "SEM", "SDEM")),
+         effect  = factor(effect, levels = c("Coefficient", "Direct",
+                                             "Indirect (neighbors)", "Total"))) %>%
+  arrange(outcome, weights, model, effect)
+
+main_table %>%
+  select(outcome, weights, model, effect, estimate, std.error, p.value, spatial_param, aic) %>%
+  gt(groupname_col = c("outcome", "weights")) %>%
+  fmt_number(columns = c(estimate, std.error, spatial_param), decimals = 3) %>%
+  fmt_number(columns = p.value, decimals = 4) %>%
+  fmt_number(columns = aic, decimals = 1) %>%
+  sub_missing(missing_text = "") %>%
+  cols_label(model = "Model", effect = "Effect", estimate = "β", std.error = "SE",
+             p.value = "p", spatial_param = "λ", aic = "AIC") %>%
+  tab_style(style = cell_fill(color = "#fff3cd"), locations = cells_body(rows = p.value < 0.05)) %>%
+  tab_header(title = paste0("Main exposure (", exposures[[main_x]], ", per SD): OLS vs. spatial error models"),
+             subtitle = "λ = spatial error parameter (how strongly neighboring PUMAs share unexplained variation). Shaded: p < 0.05")
+```
+
+
+## All exposure measures: OLS vs. SEM vs. SDEM
+
+```{r}
+#| label: p6-all-table
+error_results %>%
+  mutate(sem = sem_coef, direct = sdem_direct, indirect = sdem_indirect) %>%
+  select(y, x, w, sem, direct, indirect, sem_lambda) %>%
+  unnest_wider(sem,      names_sep = "_") %>%
+  unnest_wider(direct,   names_sep = "_") %>%
+  unnest_wider(indirect, names_sep = "_") %>%
+  left_join(ols_m3, by = c("y", "x")) %>%
+  mutate(outcome  = outcomes[y],
+         exposure = factor(exposures[x], levels = exposures),
+         weights  = weight_labels[w]) %>%
+  arrange(outcome, weights, exposure) %>%
+  select(outcome, weights, exposure,
+         ols_estimate, ols_p,
+         sem_estimate, sem_p.value,
+         direct_estimate, direct_p.value,
+         indirect_estimate, indirect_p.value,
+         sem_lambda) %>%
+  gt(groupname_col = c("outcome", "weights")) %>%
+  fmt_number(columns = c(ols_estimate, sem_estimate, direct_estimate, indirect_estimate, sem_lambda),
+             decimals = 3) %>%
+  fmt_number(columns = c(ols_p, sem_p.value, direct_p.value, indirect_p.value), decimals = 4) %>%
+  cols_label(exposure = "Exposure", ols_estimate = "OLS β", ols_p = "p",
+             sem_estimate = "SEM β", sem_p.value = "p",
+             direct_estimate = "SDEM direct", direct_p.value = "p",
+             indirect_estimate = "SDEM indirect", indirect_p.value = "p",
+             sem_lambda = "SEM λ") %>%
+  tab_spanner(label = "OLS M3", columns = c(ols_estimate, ols_p)) %>%
+  tab_spanner(label = "SEM", columns = c(sem_estimate, sem_p.value, sem_lambda)) %>%
+  tab_spanner(label = "SDEM", columns = c(direct_estimate, direct_p.value,
+                                          indirect_estimate, indirect_p.value)) %>%
+  tab_header(title = "Exposure coefficients: OLS M3 vs. spatial error models",
+             subtitle = "Continuous exposures per SD; presence = with vs. without")
+```
+
+
+## Model checks
+
+Three checks for the exposure chosen in `main_x`: a Hausman test (do OLS and SEM coefficients differ more than chance allows?), Moran's I on the SEM and SDEM residuals (should be close to zero), and AIC for OLS M3,
+SEM and SDEM (lower is better).
+
+```{r}
+#| label: p6-checks
+# Hausman test: do OLS and SEM coefficients differ more than chance allows?
+hausman_safe <- possibly(Hausman.test, otherwise = list(statistic = NA_real_, p.value = NA_real_))
+
+hausman <- error_models %>%
+  filter(x == main_x) %>%
+  mutate(test      = map(sem, hausman_safe),
+         statistic = map_dbl(test, ~ unname(.x$statistic)),
+         p.value   = map_dbl(test, ~ .x$p.value)) %>%
+  transmute(outcome = outcomes[y], weights = weight_labels[w], statistic, p.value)
+hausman
+
+# Is spatial structure left in the residuals of SEM and SDEM? (should be close to zero)
+resid_moran <- error_models %>%
+  filter(x == main_x) %>%
+  pivot_longer(c(sem, sdem), names_to = "model", values_to = "fit") %>%
+  mutate(
+    lw = map2(y, w, ~ p6_weights[[.x]][[.y]]),
+    e  = map(fit, ~ as.vector(.x$y - .x$X %*% .x$coefficients)),
+    u  = pmap(list(e, fit, lw), ~ ..1 - ..2$lambda * lag.listw(..3, ..1, zero.policy = TRUE)),
+    moran_I = map2_dbl(u, lw, ~ unname(moran.test(.x, .y, zero.policy = TRUE)$estimate[1])),
+    moran_p = map2_dbl(u, lw, ~ moran.test(.x, .y, zero.policy = TRUE)$p.value)
+  ) %>%
+  transmute(outcome = outcomes[y], weights = weight_labels[w],
+            model = toupper(model), moran_I, moran_p)
+resid_moran
+
+# Fit across models for the main measure (lower AIC = better).
+
+error_results %>%
+  filter(x == main_x) %>%
+  select(y, w, sem_aic, sdem_aic) %>%
+  left_join(p5_models %>%
+              filter(x == main_x) %>%
+              transmute(y, ols_aic = map_dbl(model, AIC)),
+            by = "y") %>%
+  mutate(outcome = outcomes[y], weights = weight_labels[w]) %>%
+  select(outcome, weights, `OLS M3` = ols_aic, SEM = sem_aic, SDEM = sdem_aic)
+```
+
+
+

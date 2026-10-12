@@ -1,0 +1,683 @@
+---
+title: "PUMA dataset, 2022–2024"
+subtitle: "Outcomes and controls for 2020 PUMAs, pooled over 2022–2024"
+author: "Natalie Novoseltseva"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    code-tools: true
+editor:
+  markdown:
+    wrap: 72
+---
+
+# About this qmd {.unnumbered}
+
+Builds the main PUMA-level dataset: one row per 2020 PUMA (2,462,
+covering the 50 states and DC) with the outcomes and controls for
+2022–2024. Prison exposure is built separately in
+`processing_prison_exposure.qmd` and joined on in the analysis qmd.
+
+Controls and divorce come from the 2022, 2023 and 2024 ACS 1-year
+samples pooled together.
+
+The period overdose rate is total deaths over total person-years, summed
+over all tracts in the PUMA and all three years (not an average of
+rates):
+
+$$Rate_{p,2022\text{–}2024} = 100{,}000 \times \frac{\sum_{y}\sum_{t \in p} D_{ty}}{\sum_{y}\sum_{t \in p} N_{t}}$$
+
+$D_{ty}$ is the CDC death count where it's reported. Counts between 1
+and 9 (and a few higher ranges) are suppressed, but the rate is still
+given, so for those the count is estimated as rate × population and kept
+inside the reported range. $N_t$ is the tract's 2020 census population.
+
+Outputs, all in `data/final/`:
+
+-   `national_puma_dataset_2022_2024.csv` and
+    `rural_puma_dataset_2022_2024.csv`
+-   `national_puma_dataset_2022_2024.gpkg`: the national table with PUMA
+    boundaries, for maps and spatial models
+-   `tract_overdose_by_year_2022_2024.csv` and
+    `tract_overdose_2022_2024.csv`: tract-level outcome, for a
+    tract-level check later
+
+When reading the CSVs back, read the IDs as text so the leading zeros
+survive:
+`read_csv(file, col_types = cols(GEOID20 = col_character(), state_fips = col_character()))`.
+
+Units: shares are percentages (0–100). Exceptions are death rates (per
+100,000), median income (2024 dollars), land area (km²), density (people
+per km²), counts and logs.
+
+# Setup {#sec-setup}
+
+```{r}
+#| label: setup
+library(tidyverse)  
+library(sf)          
+library(tidycensus)  
+library(tigris)      
+library(ipumsr)      
+
+options(tigris_use_cache = TRUE)  
+
+# range of years used
+years <- 2022:2024  
+
+# 2-digit codes for the 50 states + DC
+state_fips <- tidycensus::fips_codes %>%
+  distinct(state_code) %>%
+  filter(as.numeric(state_code) <= 56) %>%
+  pull(state_code)
+```
+
+# Building the dataset {#sec-build}
+
+## IPUMS ACS microdata (2022, 2023, 2024 1-year samples)
+
+The first run requests the extract from IPUMS and saves the microdata as
+a CSV and the codebook as `.rds`. After that it just reads the saved
+files. To request a new extract, uncomment the first code chunk.
+
+```{r}
+#| label: ipums-extract
+#| eval: false
+
+# Needs an IPUMS API key
+# one-time download of the IPUMS extract (needs an IPUMS API key)
+  
+#ipums_path <- define_extract_micro(
+#  collection  = "usa",
+#  description = "Non-institutionalized population by 2020 PUMA, ACS 1-year 2022-2024",
+#  samples     = c("us2022a", "us2023a", "us2024a"),   # three 1-year samples, all on 2020 PUMAs
+#  variables   = c(
+#    "YEAR",                            # survey year 
+#    "STATEFIP", "PUMA",                # geography: state + 2020 PUMA
+#    "PERWT", "HHWT", "PERNUM",         # person weight, household weight, person number in household
+#    "GQTYPE",                          # group-quarters type (to drop institutions, incl. prisons)
+#    "AGE", "RACE", "HISPAN",           # demographics
+#    "MARST", "DIVINYR",                # marital status, divorced in past 12 months
+#    "EDUC",                            # educational attainment
+#    "POVERTY",                         # family income as % of poverty line
+#    "EMPSTAT",                         # employed / unemployed / not in labor force
+#    "HHINCOME",                        # household income, in each survey year's dollars
+#    "CPI99"                            # IPUMS inflation factor (converts to 1999 dollars)
+#  )
+#) %>%
+#  submit_extract() %>%
+#  wait_for_extract() %>%
+#  download_extract(download_dir = "data")
+
+#ddi <- read_ipums_ddi(ipums_path)
+
+#ddi %>%
+#  read_ipums_micro() %>%
+#  write_csv("data/raw/data_ipums_2022_2024.csv")
+
+#saveRDS(ddi, "data/ddi_2022_2024.rds")   # roughly 3.3-3.4 million people per year
+```
+
+```{r}
+#| label: ipums-load
+
+#ipums data 2022-2024
+data_ipums <- read_csv("data/raw/data_ipums_2022_2024.csv",
+                       col_types = cols(.default = col_double())) 
+#codebook
+ddi <- readRDS("data/ddi_2022_2024.rds")
+```
+
+### Codes and the institutional population
+
+People in institutions (prisons, nursing homes, etc.) are dropped so
+prisoners don't shift a PUMA's race, education and poverty figures.
+
+```{r}
+#| label: ipums-codes
+#confirm the variable codes
+ipums_val_labels(ddi, GQTYPE)    # 1-4 = institutions (prisons, nursing homes, etc.)
+ipums_val_labels(ddi, MARST)     # 1-3 = married/separated, 4 = divorced
+ipums_val_labels(ddi, DIVINYR)   # 1 = No, 2 = Yes, 0/8 = outside universe / suppressed
+ipums_val_labels(ddi, EMPSTAT)   # 1 = employed, 2 = unemployed, 3 = not in labor force
+ipums_val_labels(ddi, EDUC)      # 10 = 4 years of college, 11 = 5+ years
+ipums_val_labels(ddi, RACE)      # 1 = White
+ipums_val_labels(ddi, HISPAN)    # 0 = Not Hispanic, 9 = Not reported
+
+#remove everyone living in an institution (prisons, nursing homes, etc.).
+data_noninst <- data_ipums %>%
+  filter(!GQTYPE %in% c(1, 2, 3, 4)) %>%
+  #creates puma_geoid (state code + puma)
+  mutate(puma_geoid = paste0(sprintf("%02d", STATEFIP), sprintf("%05d", PUMA))) 
+```
+
+### PUMA-level variables
+
+Percentages are ratios of weighted counts, so pooling three years
+doesn't need any adjustment. Weights for each year add up to that year's
+population, so `total_pop` is divided by 3 to get an average year.
+Incomes are converted to 2024 dollars with `CPI99` before taking the
+median.
+
+```{r}
+#| label: ipums-puma
+n_years <- n_distinct(data_noninst$YEAR)   # 3
+
+# Person-level variables
+# sum(PERWT * (condition)) adds up the weights of the people for whom the condition is TRUE
+puma_person <- data_noninst %>%
+  group_by(puma_geoid) %>%
+  summarise(
+    # Population (non-institutionalized), average over 2022-2024
+    total_pop = sum(PERWT) / n_years,
+
+    # Race: % whose race is not White (Hispanic Whites count as White)
+    pct_nonwhite    = 100 * (1 - sum(PERWT * (RACE == 1)) / sum(PERWT)),
+    # Alternative: % who are not non-Hispanic White (excludes HISPAN "not reported")
+    pct_nonwhite_nh = 100 * (1 - sum(PERWT * (RACE == 1 & HISPAN == 0)) / sum(PERWT * (HISPAN != 9))),
+
+    # Age structure: % aged 25-54, the ages with the highest overdose mortality
+    pct_age_25_54 = 100 * sum(PERWT * between(AGE, 25, 54)) / sum(PERWT),
+
+    # Education: % of people 25+ with a bachelor's degree or more
+    pct_bachelors_plus = 100 * sum(PERWT * (EDUC >= 10 & AGE >= 25)) / sum(PERWT * (AGE >= 25)),
+
+    # Poverty: % below the poverty line, among people with a poverty status (POVERTY = 0 is N/A)
+    pct_poverty = 100 * sum(PERWT * (POVERTY > 0 & POVERTY < 100)) / sum(PERWT * (POVERTY > 0)),
+
+    # Unemployment: % of the labor force (employed + unemployed) that is unemployed
+    pct_unemployed = 100 * sum(PERWT * (EMPSTAT == 2)) / sum(PERWT * (EMPSTAT %in% c(1, 2))),
+
+    # Divorce outcomes 
+    # Main outcome: % of ever-married people (15+) who divorced in the past 12 months
+    pct_divorced_past_yr = 100 * sum(PERWT * (DIVINYR == 2)) / sum(PERWT * (DIVINYR %in% c(1, 2))),
+
+    # Unweighted sample sizes over all three years, to judge reliability
+    n_person_sample   = n(),
+    n_divorced_sample = sum(DIVINYR == 2)
+  )
+
+# Annual divorce rates, to check whether one year drives the result
+puma_divorce_annual <- data_noninst %>%
+  group_by(puma_geoid, YEAR) %>%
+  summarise(pct_div = 100 * sum(PERWT * (DIVINYR == 2)) / sum(PERWT * (DIVINYR %in% c(1, 2))),
+            .groups = "drop") %>%
+  pivot_wider(names_from = YEAR, values_from = pct_div, names_prefix = "pct_divorced_past_yr_")
+
+# Median household income in 2024 dollars
+# One record per household (PERNUM == 1) with the household weight; HHINCOME = 9999999 is N/A.
+# HHINCOME * CPI99 gives 1999 dollars; dividing by the 2024 CPI99 value gives 2024 dollars.
+cpi99_2024 <- data_noninst %>%
+  filter(YEAR == 2024) %>%
+  distinct(CPI99) %>%
+  pull(CPI99)
+cpi99_2024   # should be a single number
+
+# Weighted median: sort households by income, add up their weights, and take the
+# first income where the running total reaches half of the PUMA's total weight.
+puma_household <- data_noninst %>%
+  filter(PERNUM == 1, HHINCOME != 9999999) %>%
+  mutate(hhincome_2024 = HHINCOME * CPI99 / cpi99_2024) %>%
+  group_by(puma_geoid) %>%
+  arrange(hhincome_2024, .by_group = TRUE) %>%
+  mutate(n_hh_sample = n(),
+         cum_share   = cumsum(HHWT) / sum(HHWT)) %>%
+  filter(cum_share >= 0.5) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  select(puma_geoid, medhhinc = hhincome_2024, n_hh_sample)
+
+# Combine and add logs
+puma_summary <- puma_person %>%
+  left_join(puma_divorce_annual, by = "puma_geoid") %>%
+  left_join(puma_household, by = "puma_geoid") %>%
+  mutate(
+    log_pop      = log(total_pop),
+    log_medhhinc = log(medhhinc)
+  )
+
+nrow(puma_summary)                        # should be 2462
+```
+
+## PUMA boundaries
+
+```{r}
+#| label: puma-geography
+# Cartographic-boundary PUMA polygons for the 50 states + DC
+pumas_2020 <- pumas(cb = TRUE, year = 2020) %>%
+  filter(STATEFP20 %in% state_fips)   # 50 states + DC (drops Puerto Rico and Guam)
+
+# Start the master PUMA dataset: boundaries + IPUMS variables
+puma_final <- pumas_2020 %>%
+  left_join(puma_summary, by = c("GEOID20" = "puma_geoid"))
+
+nrow(puma_final)                    # should be 2462
+sum(is.na(puma_final$total_pop))    # PUMAs with no IPUMS match 
+```
+
+## Tract populations and crosswalks
+
+`tract_pop_2020` gives the tract populations used as denominators and
+weights (downloaded the first time, then read from the saved file).
+`rel20` assigns tracts to PUMAs. The RUCA file also has a crosswalk from
+Connecticut's post-2022 tract IDs to the 2020 IDs used everywhere else,
+which is needed for the CDC data.
+
+```{r}
+#| label: tract-pop-download
+#| eval: false
+# one-time download of 2020 census tract populations (needs a Census API key).
+#get_decennial(
+#  geography = "tract",
+#  state     = state_fips,          # all 50 states + DC in one call
+#  year      = 2020,
+#  sumfile   = "pl",
+#  variables = c(tot_pop          = "P1_001N",   # total population
+#                pop_inst_gq      = "P5_002N",   # people in institutional group quarters
+#                pop_correctional = "P5_003N"),  # people in adult correctional facilities
+#  output    = "wide"
+#) %>%
+#  select(GEOID, tot_pop, pop_inst_gq, pop_correctional) %>%
+#  write_csv("data/raw/tract_pop_2020.csv")
+```
+
+```{r}
+#| label: tract-pop-load
+# 2020 census tract populations. GEOID is read as text so the leading zeros survive
+tract_pop_2020 <- read_csv("data/tract_pop_2020.csv",
+                           col_types = cols(GEOID = col_character()))
+```
+
+```{r}
+#| label: tract-crosswalks
+# Census tract -> 2020 PUMA relationship file.
+# rel20: GEOID = 11-digit tract ID, GEOID20 = 7-digit PUMA ID.
+rel20 <- read_csv("https://www2.census.gov/geo/docs/maps-data/data/rel2020/2020_Census_Tract_to_2020_PUMA.txt",
+                  col_types = cols(.default = "c")) %>%
+  transmute(
+    GEOID   = paste0(STATEFP, COUNTYFP, TRACTCE),
+    GEOID20 = paste0(STATEFP, PUMA5CE)
+  )
+
+# RUCA file: also provides a translator from Connecticut's post-2022 tract IDs
+# (planning regions, TractFIPS23) to the 2020 IDs (TractFIPS20) used everywhere else.
+ruca_raw <- read_csv("data/raw/rurality/RUCA-codes-2020-tract.csv",
+                     col_types = cols(.default = "c"))
+
+xwalk <- ruca_raw %>%
+  filter(!is.na(TractFIPS23)) %>%
+  distinct(TractFIPS23, .keep_all = TRUE) %>%
+  select(TractFIPS23, TractFIPS20)
+
+# Total 2020 population of each PUMA (all tracts), used for the coverage measure below
+puma_pop_2020 <- tract_pop_2020 %>%
+  inner_join(rel20, by = "GEOID") %>%   # keeps only tracts that have a PUMA
+  group_by(GEOID20) %>%
+  summarise(puma_pop_2020 = sum(tot_pop))
+```
+
+## Overdose deaths (CDC, 2022–2024)
+
+```{r}
+#| label: cdc-inspect
+injury_raw <- read_csv("data/raw/injury_overdose_violence_census_tract.csv")
+
+names(injury_raw)          # GEOID (tract group), NAME (its tracts), Count, Rate, ...
+table(injury_raw$Period)   # 2022, 2023, 2024, and TTM (trailing twelve months; not used)
+table(injury_raw$Intent)   # "Drug_OD" is the overdose category
+```
+
+### Deaths by tract and year
+
+```{r}
+#| label: cdc-tract-year
+# One row per real tract per year, with an estimated number of overdose deaths.
+#
+# How the CDC file is organized:
+# - Each row is a tract or a group of small tracts: GEOID = group ID, NAME = the group's
+#   tracts. Count and Rate belong to the whole group.
+# - Count is text. Exact counts are given for 0 and most larger numbers; otherwise it shows
+#   a range ("1-9", "10-15", "16-20", "21-25", "=26" meaning 26 or more). The rate is
+#   still reported for those rows.
+#
+# How deaths are built:
+# 1. Exact count where there is one. For a range, estimate the count as
+#    rate x group population / 100,000, kept within the reported range.
+# 2. Split the group's deaths among its tracts in proportion to their 2020 population,
+#    so adding tracts back up never double-counts.
+od_tract_year <- injury_raw %>%
+  filter(Intent == "Drug_OD", Period %in% years) %>%
+  transmute(
+    group_id  = GEOID,
+    NAME,
+    year      = as.integer(Period),
+    count_raw = Count,
+    rate      = na_if(as.numeric(Rate), -999)   # -999 = rate suppressed
+  ) %>%
+  # One row per real tract
+  separate_rows(NAME, sep = ",\\s*") %>%
+  mutate(GEOID = str_trim(NAME)) %>%
+  select(-NAME) %>%
+  # Translate Connecticut's new tract IDs to 2020 IDs (other states unchanged)
+  left_join(xwalk, by = c("GEOID" = "TractFIPS23")) %>%
+  mutate(GEOID = coalesce(TractFIPS20, GEOID)) %>%
+  select(-TractFIPS20) %>%
+  # Attach each tract's PUMA and 2020 population
+  left_join(rel20, by = "GEOID") %>%
+  left_join(tract_pop_2020 %>% select(GEOID, tot_pop), by = "GEOID") %>%
+  # Group-level deaths, then each tract's share
+  group_by(group_id, year) %>%
+  mutate(
+    group_pop     = sum(tot_pop, na.rm = TRUE),
+    # Exact count if Count is just a number, otherwise NA (it's a range)
+    count_exact   = if_else(str_detect(count_raw, "^\\d+$"), parse_number(count_raw), NA_real_),
+    count_imputed = is.na(count_exact),
+    # Bounds of a range: "1-9" -> 1 and 9; "=26" (26 or more) -> 26 and no upper limit
+    count_lo = parse_number(count_raw),
+    count_hi = if_else(str_detect(count_raw, "^\\d+-\\d+$"),
+                       parse_number(str_extract(count_raw, "\\d+$")), Inf),
+    # Estimate from the rate
+    count_est = rate * group_pop / 1e5,
+    # Exact count if there is one; otherwise the estimate, kept within the range
+    group_deaths = case_when(
+      !count_imputed       ~ count_exact,
+      count_est < count_lo ~ count_lo,
+      count_est > count_hi ~ count_hi,
+      TRUE                 ~ count_est
+    ),
+    deaths = group_deaths * tot_pop / group_pop
+  ) %>%
+  ungroup()
+
+# Checks: matching
+od_tract_year %>% count(GEOID, year) %>% filter(n > 1) %>% nrow()   # duplicates; should be 0
+
+od_tract_year %>%
+  summarise(matched_to_puma = mean(!is.na(GEOID20)),   # want ~1
+            has_population  = mean(!is.na(tot_pop)),   # want ~1
+            has_deaths      = mean(!is.na(deaths)))    # want ~1
+
+od_tract_year %>%
+  filter(str_starts(GEOID, "09")) %>%                  # Connecticut
+  summarise(ct_matched_to_puma = mean(!is.na(GEOID20)))   # want ~1
+
+# Checks: counts
+# How many groups needed an estimated count, by year
+od_tract_year %>%
+  distinct(group_id, year, count_imputed) %>%
+  count(year, count_imputed)
+
+# Total deaths by year (should follow the national trend, with a large drop in 2024)
+od_tract_year %>%
+  group_by(year) %>%
+  summarise(total_deaths = sum(deaths, na.rm = TRUE))
+
+# Are 2020 census populations close to the CDC's denominators?
+# For groups with an exact count above zero, count / rate x 100,000 is the CDC's denominator.
+od_tract_year %>%
+  distinct(group_id, year, count_exact, rate, group_pop) %>%
+  filter(count_exact > 0, rate > 0) %>%
+  mutate(ratio = (count_exact / rate * 1e5) / group_pop) %>%
+  pull(ratio) %>%
+  summary()                                            # median near 1 = estimates sound
+
+# How often the rate-based estimate fell outside the reported range (and was pulled back in)
+od_tract_year %>%
+  distinct(group_id, year, count_imputed, count_est, count_lo, count_hi) %>%
+  filter(count_imputed) %>%
+  summarise(share_below   = mean(count_est < count_lo, na.rm = TRUE),
+            share_above   = mean(count_est > count_hi, na.rm = TRUE),
+            share_no_rate = mean(is.na(count_est)))
+```
+
+```{r}
+#| label: cdc-annual
+od_puma_year <- od_tract_year %>%
+  filter(!is.na(GEOID20), !is.na(deaths), tot_pop > 0) %>%
+  group_by(GEOID20, year) %>%
+  summarise(deaths = sum(deaths), pop = sum(tot_pop), .groups = "drop") %>%
+  mutate(rate = 1e5 * deaths / pop)
+
+# Wide version, kept in the dataset for the "is one year driving the result?" check
+od_puma_annual <- od_puma_year %>%
+  select(GEOID20, year, rate) %>%
+  pivot_wider(names_from = year, values_from = rate, names_prefix = "overdose_rate_")
+
+# 1. Distributions by year
+od_puma_year %>%
+  group_by(year) %>%
+  summarise(mean = mean(rate), median = median(rate), sd = sd(rate), n_pumas = n())
+
+ggplot(od_puma_year, aes(rate, colour = factor(year))) +
+  geom_density() +
+  labs(title = "PUMA overdose rates by year", x = "Deaths per 100,000", colour = "Year") +
+  theme_minimal()
+
+# 2. Year-to-year correlation of PUMA rates (and rank correlation, less sensitive to outliers)
+od_puma_annual %>%
+  select(starts_with("overdose_rate_")) %>%
+  cor(use = "complete.obs")
+
+od_puma_annual %>%
+  select(starts_with("overdose_rate_")) %>%
+  cor(use = "complete.obs", method = "spearman")
+
+# 3. Maps by year (lower 48 shown; Alaska and Hawaii would stretch the map)
+pumas_2020 %>%
+  filter(!STATEFP20 %in% c("02", "15")) %>%
+  select(GEOID20) %>%
+  inner_join(od_puma_year, by = "GEOID20") %>%
+  ggplot() +
+  geom_sf(aes(fill = rate), colour = NA) +
+  scale_fill_viridis_c(name = "Per 100,000", option = "magma", direction = -1) +
+  facet_wrap(~year, ncol = 1) +
+  theme_void()
+```
+
+### Pooled period rate
+
+```{r}
+#| label: cdc-pooled
+# Number of years pooled (3)
+n_years <- od_tract_year %>% distinct(year) %>% nrow()
+
+# Period rate = total deaths / total population over all tracts and all three years.
+# Deaths are exact CDC counts where reported, otherwise estimated from the rate (see above).
+od_puma_pooled <- od_tract_year %>%
+  filter(!is.na(GEOID20), !is.na(deaths), tot_pop > 0) %>%
+  group_by(GEOID20) %>%
+  summarise(
+    overdose_deaths_2022_2024 = sum(deaths),        # total deaths over 3 years
+    overdose_pop_years        = sum(tot_pop),       # person-years at risk
+    overdose_rate_2022_2024   = 1e5 * overdose_deaths_2022_2024 / overdose_pop_years,
+    n_tract_years             = n(),
+    # % of the PUMA's deaths that are estimated from a rate rather than an exact count
+    # (left empty for PUMAs with no deaths, where a share can't be calculated)
+    pct_deaths_estimated      = if_else(sum(deaths) > 0,
+                                        100 * sum(deaths * count_imputed) / sum(deaths),
+                                        NA_real_)
+  ) %>%
+  left_join(od_puma_annual, by = "GEOID20") %>%
+  left_join(puma_pop_2020, by = "GEOID20") %>%
+  mutate(
+    # Coverage: % of the PUMA's person-years with usable data
+    pct_popyears_with_overdose_data = 100 * overdose_pop_years / (n_years * puma_pop_2020)
+  ) %>%
+  select(-puma_pop_2020)
+
+od_puma_pooled %>%
+  select(overdose_rate_2022_2024, pct_popyears_with_overdose_data, pct_deaths_estimated) %>%
+  summary()
+
+puma_final <- puma_final %>%
+  left_join(od_puma_pooled, by = "GEOID20")
+
+puma_final %>%
+  filter(is.na(overdose_rate_2022_2024)) %>%
+  nrow()                                       # PUMAs with no overdose data at all
+```
+
+### Tract-level outcome
+
+```{r}
+#| label: cdc-tract-save
+# Tract-level overdose outcome, for the tract-level sensitivity check.
+# Tracts in the same CDC group share the group's rate, so their tract rates
+# aren't independent. A tract-level model should cluster standard errors by group_id!!!
+
+# Tract x year (long format)
+od_tract_year %>%
+  filter(!is.na(GEOID20)) %>%
+  select(GEOID, GEOID20, group_id, year, count_raw, count_imputed, rate, tot_pop, deaths) %>%
+  write_csv("data/final/tract_overdose_by_year_2022_2024.csv")
+
+# Pooled 2022-2024 rate per tract
+od_tract_year %>%
+  filter(!is.na(GEOID20), !is.na(deaths), tot_pop > 0) %>%
+  group_by(GEOID, GEOID20) %>%
+  summarise(
+    overdose_deaths_2022_2024 = sum(deaths),
+    overdose_pop_years        = sum(tot_pop),
+    overdose_rate_2022_2024   = 1e5 * overdose_deaths_2022_2024 / overdose_pop_years,
+    n_years                   = n(),
+    pct_deaths_estimated      = if_else(sum(deaths) > 0,
+                                        100 * sum(deaths[count_imputed]) / sum(deaths),
+                                        NA_real_),
+    .groups = "drop"
+  ) %>%
+  write_csv("data/final/tract_overdose_2022_2024.csv")
+```
+
+## Rurality (RUCA codes)
+
+Share of each PUMA's 2020 population living in each type of RUCA tract.
+
+```{r}
+#| label: ruca
+ruca <- ruca_raw %>%
+  transmute(GEOID = TractFIPS20, ruca = as.numeric(PrimaryRUCA))
+
+# sum(tot_pop * (condition)) adds up the population of the tracts where the condition is TRUE
+puma_rural_ruca <- tract_pop_2020 %>%
+  select(GEOID, tot_pop) %>%
+  inner_join(rel20, by = "GEOID") %>%    # keeps only tracts that have a PUMA
+  inner_join(ruca,  by = "GEOID") %>%    # keeps only tracts that have a RUCA code
+  filter(!is.na(ruca), ruca != 99, tot_pop > 0) %>%   # 99 = no code (e.g. water-only tracts)
+  group_by(GEOID20) %>%
+  summarise(
+    pct_pop_metro      = 100 * sum(tot_pop * (ruca %in% 1:3)) / sum(tot_pop),   # metropolitan
+    pct_pop_micro      = 100 * sum(tot_pop * (ruca %in% 4:6)) / sum(tot_pop),   # micropolitan
+    pct_pop_small_town = 100 * sum(tot_pop * (ruca %in% 7:9)) / sum(tot_pop),   # small town
+    pct_pop_rural      = 100 * sum(tot_pop * (ruca == 10))    / sum(tot_pop)    # rural
+  )
+
+puma_final <- puma_final %>%
+  left_join(puma_rural_ruca, by = "GEOID20")
+
+puma_final %>%
+  filter(is.na(pct_pop_rural)) %>%
+  nrow()                                 # ideally 0
+```
+
+## Religion
+
+```{r}
+#| label: religion
+# 2020 U.S. Religion Census (county level). TOTRATE_2020 = adherents of all
+# congregations as a % of the 2020 county population. It counts people affiliated
+# with a congregation, not people who call themselves religious.
+# County to PUMA: each tract gets its county's rate, then the PUMA value is the
+# population-weighted average over its tracts.
+religion_county <- readxl::read_excel("data/raw/religion.xlsx") %>%
+  transmute(county_fips = sprintf("%05d", as.integer(FIPS)),
+            # a few small counties are above 100% (members counted where the
+            # congregation is, not where they live), so cap at 100
+            pct_religious = pmin(TOTRATE_2020, 100))
+
+nrow(religion_county)   # 3,143 counties
+
+puma_relig <- tract_pop_2020 %>%
+  inner_join(rel20, by = "GEOID") %>%
+  mutate(county_fips = str_sub(GEOID, 1, 5)) %>%
+  inner_join(religion_county, by = "county_fips") %>%
+  filter(tot_pop > 0) %>%
+  group_by(GEOID20) %>%
+  summarise(pct_religious = weighted.mean(pct_religious, tot_pop))
+
+nrow(puma_relig)   # should be 2,462
+summary(puma_relig$pct_religious)
+
+puma_final <- puma_final %>%
+  select(-any_of("pct_religious")) %>%        
+  left_join(puma_relig, by = "GEOID20")
+```
+
+## Analysis dataset
+
+```{r}
+#| label: puma-df
+# Add columns, area and density, then drop the geometry for the CSV version.
+puma_final <- puma_final %>%
+  mutate(
+    pct_pop_nonmetro = 100 - pct_pop_metro,   # defines the rural subsample (> 50)
+    state_fips       = substr(GEOID20, 1, 2), # for state fixed effects / clustering
+    land_area_km2    = as.numeric(ALAND20) / 1e6,
+    pop_density      = total_pop / land_area_km2,
+    log_pop_density  = log(pop_density)
+  )
+
+puma_df <- puma_final %>% st_drop_geometry()
+
+nrow(puma_df)                                   # should be 2462
+sum(is.na(puma_df$overdose_rate_2022_2024))
+sum(is.na(puma_df$pct_divorced_past_yr))
+```
+
+## Rural subset and save
+
+Rural PUMAs: more than 50% of the population lives in non-metro (RUCA
+4–10) tracts.
+
+```{r}
+#| label: rural-subset
+# Rural PUMAs: more than 50% of the population lives in non-metro (RUCA 4-10) tracts.
+puma_rural <- puma_df %>% filter(pct_pop_nonmetro > 50)
+nrow(puma_rural)
+```
+
+```{r}
+#| label: save
+write_csv(puma_df,    "data/final/national_puma_dataset_2022_2024.csv")
+write_csv(puma_rural, "data/final/rural_puma_dataset_2022_2024.csv")
+
+# With boundaries, for maps and spatial models (delete_dsn overwrites an existing file)
+st_write(puma_final, "data/final/national_puma_dataset_2022_2024.gpkg", delete_dsn = TRUE)
+```
+
+# Variables {.unnumbered}
+
+| Variable | Meaning | Source |
+|------------------------|------------------------|------------------------|
+| `GEOID20`, `state_fips` | 7-digit PUMA ID; 2-digit state code | boundary file |
+| `total_pop`, `log_pop` | non-institutional population (average year, 2022–2024) and its log | IPUMS |
+| `pct_nonwhite`, `pct_nonwhite_nh` | \% not White; % not non-Hispanic White | IPUMS |
+| `pct_age_25_54` | \% aged 25–54 | IPUMS |
+| `pct_bachelors_plus` | \% of people 25+ with a bachelor's or more | IPUMS |
+| `pct_poverty` | \% below the poverty line | IPUMS |
+| `pct_unemployed` | \% of the labor force unemployed | IPUMS |
+| `medhhinc`, `log_medhhinc` | median household income (2024 \$) and its log | IPUMS |
+| `pct_divorced_past_yr` | main divorce outcome: % of ever-married people divorced in the past 12 months, 2022–2024 | IPUMS |
+| `pct_divorced_past_yr_2022`, `_2023`, `_2024` | same, single years (noisy, for checks) | IPUMS |
+| `pct_divorced_past_yr_atrisk`, `pct_currently_divorced` | alternative divorce measures | IPUMS |
+| `n_person_sample`, `n_hh_sample`, `n_divorced_sample` | unweighted sample sizes over 3 years | IPUMS |
+| `overdose_rate_2022_2024` | main overdose outcome: deaths per 100,000, 2022–2024 | CDC |
+| `overdose_rate_2022`, `_2023`, `_2024` | annual rates (for checks) | CDC |
+| `overdose_deaths_2022_2024`, `overdose_pop_years`, `n_tract_years` | deaths, person-years and tract-years behind the period rate | CDC |
+| `pct_popyears_with_overdose_data` | \% of the PUMA's person-years with usable data | CDC |
+| `pct_deaths_estimated` | \% of the PUMA's deaths estimated from a rate because the count was suppressed | CDC |
+| `pct_pop_metro`, `_micro`, `_small_town`, `_rural`, `pct_pop_nonmetro` | \% of population by RUCA tract type | RUCA |
+| `land_area_km2`, `pop_density`, `log_pop_density` | land area; people per km²; log | boundary file + IPUMS |
+| pct_religious | \% of population who belong to any religion | 2020 U.S. Religion Census |
