@@ -287,7 +287,7 @@ which is needed for the CDC data.
 ```{r}
 #| label: tract-pop-load
 # 2020 census tract populations. GEOID is read as text so the leading zeros survive
-tract_pop_2020 <- read_csv("data/tract_pop_2020.csv",
+tract_pop_2020 <- read_csv("data/raw/tract_pop_2020.csv",
                            col_types = cols(GEOID = col_character()))
 ```
 
@@ -586,16 +586,22 @@ puma_final %>%
 
 ```{r}
 #| label: religion
-# 2020 U.S. Religion Census (county level). TOTRATE_2020 = adherents of all
-# congregations as a % of the 2020 county population. It counts people affiliated
-# with a congregation, not people who call themselves religious.
-# County to PUMA: each tract gets its county's rate, then the PUMA value is the
+#| label: religion
+# 2020 U.S. Religion Census (county level). *RATE_2020 = adherents as a % of the 2020
+# county population, overall and by religious family. Counts people affiliated with a
+# congregation, counted where the congregation is (so a few small counties exceed 100%).
+# County to PUMA: each tract gets its county's rate; the PUMA value is the
 # population-weighted average over its tracts.
 religion_county <- readxl::read_excel("data/raw/religion.xlsx") %>%
-  transmute(county_fips = sprintf("%05d", as.integer(FIPS)),
-            # a few small counties are above 100% (members counted where the
-            # congregation is, not where they live), so cap at 100
-            pct_religious = pmin(TOTRATE_2020, 100))
+  transmute(
+    county_fips          = sprintf("%05d", as.integer(FIPS)),
+    pct_religious        = TOTRATE_2020,
+    pct_evangelical      = EVANRATE_2020,
+    pct_catholic         = CATHRATE_2020,
+    pct_mainline         = MPRTRATE_2020,
+    pct_black_protestant = BPRTRATE_2020
+  ) %>%
+  mutate(across(starts_with("pct_"), ~ pmin(replace_na(.x, 0), 100)))   # missing = no congregations; cap at 100
 
 nrow(religion_county)   # 3,143 counties
 
@@ -605,13 +611,13 @@ puma_relig <- tract_pop_2020 %>%
   inner_join(religion_county, by = "county_fips") %>%
   filter(tot_pop > 0) %>%
   group_by(GEOID20) %>%
-  summarise(pct_religious = weighted.mean(pct_religious, tot_pop))
+  summarise(across(starts_with("pct_"), ~ weighted.mean(.x, tot_pop)))
 
 nrow(puma_relig)   # should be 2,462
-summary(puma_relig$pct_religious)
+summary(puma_relig)
 
 puma_final <- puma_final %>%
-  select(-any_of("pct_religious")) %>%        
+  select(-any_of(names(puma_relig)[-1])) %>%      # drop old versions if re-running
   left_join(puma_relig, by = "GEOID20")
 ```
 
@@ -660,7 +666,7 @@ st_write(puma_final, "data/final/national_puma_dataset_2022_2024.gpkg", delete_d
 # Variables {.unnumbered}
 
 | Variable | Meaning | Source |
-|------------------------|------------------------|------------------------|
+|----|----|----|
 | `GEOID20`, `state_fips` | 7-digit PUMA ID; 2-digit state code | boundary file |
 | `total_pop`, `log_pop` | non-institutional population (average year, 2022–2024) and its log | IPUMS |
 | `pct_nonwhite`, `pct_nonwhite_nh` | \% not White; % not non-Hispanic White | IPUMS |

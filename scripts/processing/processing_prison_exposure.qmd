@@ -169,32 +169,32 @@ time; after that the saved file is read.
 # One-time computation of tract exposure to prisons. Slow and memory-heavy.
 # Not run when rendering; the saved file is read in the next chunk.
 # Each prison adds exp(-distance / h).
-prison_info <- prisons %>%
-  st_drop_geometry() %>%
-  transmute(prison_id = row_number())
+#prison_info <- prisons %>%
+#  st_drop_geometry() %>%
+#  transmute(prison_id = row_number())
 
-tibble(
-  GEOID     = rep(tract_pts$GEOID, times = nrow(prisons)),
-  prison_id = rep(prison_info$prison_id, each = nrow(tract_pts)),
-  d_km      = as.numeric(st_distance(tract_pts, prisons)) / 1000
-) %>%
-  left_join(prison_info, by = "prison_id") %>%
-  group_by(GEOID) %>%
-  summarise(
-    dist_nearest_prison_km = min(d_km),
+#tibble(
+#  GEOID     = rep(tract_pts$GEOID, times = nrow(prisons)),
+#  prison_id = rep(prison_info$prison_id, each = nrow(tract_pts)),
+#  d_km      = as.numeric(st_distance(tract_pts, prisons)) / 1000
+#) %>%
+#  left_join(prison_info, by = "prison_id") %>%
+#  group_by(GEOID) %>%
+#  summarise(
+#    dist_nearest_prison_km = min(d_km),
     # every prison counts 1
-    prison_exp_h1   = sum(exp(-d_km / 1)),
-    prison_exp_h5   = sum(exp(-d_km / 5)),
-    prison_exp_h10  = sum(exp(-d_km / 10)),
-    prison_exp_h25  = sum(exp(-d_km / 25)),
+#    prison_exp_h1   = sum(exp(-d_km / 1)),
+#    prison_exp_h5   = sum(exp(-d_km / 5)),
+#    prison_exp_h10  = sum(exp(-d_km / 10)),
+#    prison_exp_h25  = sum(exp(-d_km / 25)),
     # number of prisons in each distance ring (rings don't overlap)
-    ring_0_2   = sum(d_km < 2),
-    ring_2_5 = sum(d_km >= 2  & d_km < 5),
-    ring_5_10  = sum(d_km >= 5  & d_km < 10),
-    ring_10_25 = sum(d_km >= 10 & d_km < 25),
-    ring_25_50 = sum(d_km >= 25 & d_km < 50)
-  ) %>%
-  write_csv("data/final/tract_prison_exposure.csv")
+#    ring_0_2   = sum(d_km < 2),
+#    ring_2_5 = sum(d_km >= 2  & d_km < 5),
+#    ring_5_10  = sum(d_km >= 5  & d_km < 10),
+#    ring_10_25 = sum(d_km >= 10 & d_km < 25),
+#    ring_25_50 = sum(d_km >= 25 & d_km < 50)
+#  ) %>%
+#  write_csv("data/final/tract_prison_exposure.csv")
 ```
 
 ```{r}
@@ -278,10 +278,300 @@ pumas %>%
   theme_void()
 ```
 
+```{r}
+#| label: fig-exposure-example
+#| fig-width: 11
+#| fig-height: 5.5
+
+library(patchwork)
+
+h_ex <- 5   # decay distance shown in the figure (km)
+
+# Example PUMA: one that contains exactly one prison (change to any GEOID20 you like)
+puma_exp <- read_csv("data/final/puma_prison_exposure.csv",
+                     col_types = cols(GEOID20 = col_character()))
+
+example_puma <- puma_exp %>%
+  filter(num_prisons_in_puma == 1) %>%
+  slice_max(prison_exp_h5, n = 1) %>%
+  pull(GEOID20)
+
+# PUMA outline and its tracts (polygons only for the picture)
+puma_shape <- st_read("data/final/national_puma_dataset_2022_2024.gpkg", quiet = TRUE) %>%
+  filter(GEOID20 == example_puma) %>%
+  st_transform(5070)
+
+ex_tracts <- tract_weights %>%
+  filter(GEOID20 == example_puma) %>%
+  left_join(tract_exposure %>% select(GEOID, prison_exp_h5), by = "GEOID")
+
+tract_shapes <- tigris::tracts(state = str_sub(example_puma, 1, 2), cb = TRUE, year = 2020) %>%
+  filter(GEOID %in% ex_tracts$GEOID) %>%
+  st_transform(5070) %>%
+  left_join(ex_tracts, by = "GEOID")
+
+ex_centers <- tract_pts %>% filter(GEOID %in% ex_tracts$GEOID)
+
+# Example tract: the one with the highest exposure in this PUMA
+ex_tract_id <- ex_tracts %>% slice_max(prison_exp_h5, n = 1) %>% pull(GEOID)
+ex_pt <- ex_centers %>% filter(GEOID == ex_tract_id)
+
+# Rings at h, 2h and 3h around the example tract's population center
+rings <- tibble(k = 1:3, label = c("h", "2h", "3h")) %>%
+  mutate(geometry = map(k, ~ st_geometry(st_buffer(ex_pt, .x * h_ex * 1000))[[1]])) %>%
+  st_as_sf(crs = 5070)
+
+# Prisons within 3h, with their distance and weight
+near_prisons <- prisons %>%
+  mutate(d_km = as.numeric(st_distance(geometry, ex_pt)) / 1000) %>%
+  filter(d_km <= 3 * h_ex) %>%
+  mutate(weight = exp(-d_km / h_ex),
+         label  = sprintf("%.1f km → %.2f", d_km, weight))
+
+tract_value <- ex_tracts %>% filter(GEOID == ex_tract_id) %>% pull(prison_exp_h5)
+puma_value  <- puma_exp %>% filter(GEOID20 == example_puma) %>% pull(prison_exp_h5)
+
+# Panel A: the map
+map_box <- st_bbox(st_union(st_geometry(puma_shape), st_geometry(rings)))
+
+p_map <- ggplot() +
+  geom_sf(data = tract_shapes, aes(fill = prison_exp_h5), colour = "white", linewidth = 0.2) +
+  geom_sf(data = puma_shape, fill = NA, colour = "grey20", linewidth = 0.6) +
+  geom_sf(data = rings, fill = NA, colour = "grey40", linetype = "dashed", linewidth = 0.4) +
+  geom_sf_text(data = rings %>% st_cast("LINESTRING") %>% st_line_sample(sample = 0.25) %>%
+                 st_as_sf() %>% mutate(label = rings$label),
+               aes(label = label), size = 3, colour = "grey30", nudge_y = 600) +
+  geom_sf(data = ex_centers, colour = "grey45", size = 0.8) +
+  geom_sf(data = ex_pt, colour = "black", size = 2.5) +
+  geom_sf(data = near_prisons, shape = 17, colour = "#B23A1E", size = 3) +
+  geom_sf_label(data = near_prisons, aes(label = label), size = 2.8,
+                nudge_y = 1500, label.size = 0, alpha = 0.85) +
+  scale_fill_distiller(palette = "Greys", direction = 1,
+                       name = paste0("Tract exposure\n(h = ", h_ex, " km)")) +
+  coord_sf(xlim = map_box[c("xmin", "xmax")], ylim = map_box[c("ymin", "ymax")]) +
+  labs(title = "A. One PUMA, its tracts and nearby prisons") +
+  theme_void() +
+  theme(legend.position = "bottom")
+
+# Panel B: how much a prison counts, by distance
+decay <- expand_grid(h = c(1, 5, 10, 25), d_km = seq(0, 40, by = 0.25)) %>%
+  mutate(weight = exp(-d_km / h),
+         main   = h == h_ex)
+
+p_curve <- ggplot(decay, aes(d_km, weight, group = h)) +
+  geom_line(data = filter(decay, !main), colour = "grey70", linewidth = 0.6) +
+  geom_line(data = filter(decay, main), colour = "black", linewidth = 1) +
+  geom_text(data = decay %>% group_by(h) %>% filter(d_km == 6),
+            aes(label = paste0("h = ", h)), hjust = 0, nudge_y = 0.03, size = 3,
+            colour = "grey30") +
+  geom_point(data = st_drop_geometry(near_prisons), aes(d_km, weight), inherit.aes = FALSE,
+             shape = 17, colour = "#B23A1E", size = 3) +
+  geom_hline(yintercept = exp(-1), linetype = "dotted", colour = "grey50") +
+  annotate("text", x = 40, y = exp(-1), label = "0.37 at d = h", hjust = 1, vjust = -0.5,
+           size = 3, colour = "grey40") +
+  labs(title = "B. How much one prison counts",
+       x = "Distance from tract population center (km)",
+       y = "Contribution of one prison, exp(−d / h)") +
+  theme_minimal()
+
+p_map + p_curve +
+  plot_layout(widths = c(1.3, 1)) +
+  plot_annotation(
+    caption = sprintf(paste(
+      "Example tract (black dot): exposure = sum of prison contributions = %.2f (h = %d km).",
+      "Prisons farther than 3h add less than 0.05 each but are still counted.",
+      "PUMA value = population-weighted average of its tracts = %.2f.", sep = "\n"),
+      tract_value, h_ex, puma_value),
+    theme = theme(plot.caption = element_text(hjust = 0)))
+```
+
+```{r}
+#| label: exposure-example-candidates
+
+puma_exp <- read_csv("data/final/puma_prison_exposure.csv",
+                     col_types = cols(GEOID20 = col_character()))
+
+puma_info <- st_read("data/final/national_puma_dataset_2022_2024.gpkg", quiet = TRUE) %>%
+  st_transform(5070) %>%
+  select(GEOID20, NAMELSAD20, STUSPS20)
+
+# PUMAs with exactly one prison, most locally exposed first
+puma_exp %>%
+  filter(num_prisons_in_puma >= 1) %>%
+  left_join(st_drop_geometry(st_read("data/final/national_puma_dataset_2022_2024.gpkg", quiet = TRUE)) %>%
+              select(GEOID20, NAMELSAD20, STUSPS20, pct_pop_nonmetro),
+            by = "GEOID20") %>%
+  filter(pct_pop_nonmetro > 50) %>%
+  arrange(desc(prison_exp_h1)) %>%
+  select(GEOID20, NAMELSAD20, STUSPS20, num_prisons_in_puma, prison_exp_h1, prison_exp_h5) %>%
+  head(15)
+```
+
+```{r}
+#| label: fig-exposure-example
+#| fig-width: 11
+#| fig-height: 6
+
+library(patchwork)
+
+h_ex         <- 5               # decay distance shown (km): 1, 5, 10 or 25
+example_puma <- "3600704"       # Cayuga & Onondaga (South) Counties PUMA, NY
+example_tract <- "36011042100"  # Census Tract 421, next to Auburn Correctional Facility
+
+exp_col <- paste0("prison_exp_h", h_ex)   # exposure column that matches h_ex
+
+puma_shape <- puma_info %>% filter(GEOID20 == example_puma)
+
+# Tracts in the PUMA, with their exposure (for h_ex) and weights
+ex_tracts <- tract_weights %>%
+  filter(GEOID20 == example_puma) %>%
+  left_join(tract_exposure %>% select(GEOID, exposure = all_of(exp_col)), by = "GEOID")
+
+# All tracts in the state (neighbors are drawn in grey), and this PUMA's tracts
+state_tracts <- tigris::tracts(state = str_sub(example_puma, 1, 2), cb = TRUE, year = 2020) %>%
+  st_transform(5070)
+
+tract_shapes <- state_tracts %>%
+  filter(GEOID %in% ex_tracts$GEOID) %>%
+  left_join(ex_tracts, by = "GEOID")
+
+ex_centers <- tract_pts %>% filter(GEOID %in% ex_tracts$GEOID)
+
+# Example tract
+ex_tract <- tract_shapes %>% filter(GEOID == example_tract)
+ex_pt    <- ex_centers %>% filter(GEOID == example_tract)
+ex_xy    <- st_coordinates(ex_pt)
+
+# Rings at h, 2h, 3h around the example tract's population center
+rings <- tibble(k = 1:3) %>%
+  mutate(geometry = map(k, ~ st_geometry(st_buffer(ex_pt, .x * h_ex * 1000))[[1]])) %>%
+  st_as_sf(crs = 5070)
+
+# Ring labels on each circle, at the chosen angle
+angle <- 180 * pi / 180   # 0 = right, 90 = top, 180 = left, 270 = bottom
+ring_labels <- tibble(k = 1:3,
+                      x = ex_xy[, "X"] + cos(angle) * (1:3) * h_ex * 1000,
+                      y = ex_xy[, "Y"] + sin(angle) * (1:3) * h_ex * 1000,
+                      label = paste0(c("h", "2h", "3h"), " = ", (1:3) * h_ex, " km"))
+
+# Prisons within 4h, with their distance and weight
+near_prisons <- prisons %>%
+  mutate(d_km = as.numeric(st_distance(geometry, ex_pt)) / 1000) %>%
+  filter(d_km <= 4 * h_ex) %>%
+  mutate(weight = exp(-d_km / h_ex),
+         label  = sprintf("%s\n%.2f km → %.2f", str_to_title(NAME), d_km, weight))
+
+tract_value <- ex_tract$exposure
+puma_value  <- puma_exp %>% filter(GEOID20 == example_puma) %>% pull(all_of(exp_col))
+
+# Map window: 4h around the example tract
+zoom <- 3.3 * h_ex * 1000
+
+# Legend entries
+ex_label     <- paste0("Population center of ", ex_tract$NAMELSAD)
+point_breaks <- c(ex_label, "Population centers of other tracts", "State or federal prison")
+line_breaks  <- c("PUMA boundary",
+                  paste0("Distance rings (", h_ex, ", ", 2 * h_ex, ", ", 3 * h_ex, " km)"))
+
+# Panel A: map
+p_map <- ggplot() +
+  geom_sf(data = state_tracts, fill = "grey94", colour = "white", linewidth = 0.3) +
+  geom_sf(data = tract_shapes, aes(fill = exposure), colour = "white", linewidth = 0.3) +
+  geom_sf(data = puma_shape, aes(linetype = line_breaks[1]), fill = NA,
+          colour = "grey15", linewidth = 0.8, key_glyph = "path") +
+  geom_sf(data = rings, aes(linetype = line_breaks[2]), fill = NA,
+          colour = "grey30", linewidth = 0.5, key_glyph = "path") +
+  geom_label(data = ring_labels, aes(x, y, label = label), size = 2.8,
+             fill = "white", label.size = 0, label.padding = unit(0.1, "lines")) +
+  geom_sf(data = ex_centers, aes(colour = point_breaks[2]), size = 1) +
+  geom_sf(data = near_prisons, aes(colour = point_breaks[3]), shape = 17, size = 3.5) +
+  ggrepel::geom_label_repel(
+    data = near_prisons,
+    aes(label = label, geometry = geometry),
+    stat = "sf_coordinates",
+    size = 2.8, fill = "white", colour = "black",
+    label.size = 0.2, lineheight = 0.9,
+    box.padding = 0.8, min.segment.length = 0,
+    seed = 1
+  ) +
+  geom_sf(data = ex_pt, aes(colour = point_breaks[1]), size = 3.5,
+          shape = 21, fill = "black", stroke = 1.2) +       # drawn last, on top
+  scale_fill_distiller(palette = "Blues", direction = 1,
+                       name = paste0("Tract exposure (h = ", h_ex, " km)"),
+                       guide = guide_colourbar(order = 1, title.position = "top",
+                                               barwidth = unit(4, "cm"))) +
+  scale_colour_manual(
+    name = NULL,
+    breaks = point_breaks,
+    values = setNames(c("white", "grey40", "#B23A1E"), point_breaks),
+    guide = guide_legend(order = 2, ncol = 1,
+                         override.aes = list(shape = c(21, 19, 17), size = c(3.5, 1.5, 3.5),
+                                             fill = c("black", NA, NA),
+                                             colour = c("black", "grey40", "#B23A1E")))
+  ) +
+  scale_linetype_manual(
+    name = NULL,
+    breaks = line_breaks,
+    values = setNames(c("solid", "dashed"), line_breaks),
+    guide = guide_legend(order = 3, ncol = 1,
+                         override.aes = list(colour = c("grey15", "grey30"),
+                                             linewidth = c(0.8, 0.5)))
+  ) +
+  coord_sf(xlim = ex_xy[, "X"] + c(-zoom, zoom),
+           ylim = ex_xy[, "Y"] + c(-zoom, zoom), expand = FALSE) +
+  labs(title    = paste0("A. ", puma_shape$NAMELSAD20, ", ", puma_shape$STUSPS20),
+       subtitle = paste0(ex_tract$NAMELSAD, ", ", ex_tract$NAMELSADCO,
+                         " (GEOID ", ex_tract$GEOID, ")")) +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold"),
+        plot.title.position = "plot",
+        plot.subtitle = element_text(size = 9, colour = "grey30"))
+
+# Panel B: how much one prison counts, by distance
+decay <- expand_grid(h = c(1, 5, 10, 25), d_km = seq(0, 30, by = 0.1)) %>%
+  mutate(weight = exp(-d_km / h))
+
+p_curve <- ggplot(decay, aes(d_km, weight, group = h)) +
+  geom_line(data = filter(decay, h != h_ex), colour = "grey75", linewidth = 0.6) +
+  geom_line(data = filter(decay, h == h_ex), colour = "black", linewidth = 1) +
+  geom_text(data = decay %>% filter(abs(d_km - 4) < 0.05),
+            aes(label = paste0("h = ", h)), hjust = 0, nudge_x = 0.3, size = 3,
+            colour = "grey30") +
+  geom_point(data = st_drop_geometry(near_prisons), aes(d_km, weight), inherit.aes = FALSE,
+             shape = 17, colour = "#B23A1E", size = 3.5) +
+  geom_hline(yintercept = exp(-1), linetype = "dotted", colour = "grey50") +
+  annotate("text", x = 30, y = exp(-1), label = "0.37 at d = h", hjust = 1, vjust = -0.5,
+           size = 3, colour = "grey40") +
+  labs(title = "B. How much one prison counts",
+       x = "Distance from tract population center (km)",
+       y = "Contribution of one prison, exp(−d / h)") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# Combine: legends collected below both panels
+p_map + p_curve +
+  plot_layout(widths = c(1.2, 1), guides = "collect") +
+  plot_annotation(
+    caption = sprintf(paste(
+      "%s: exposure = sum of all prison contributions = %.2f (h = %d km).",
+      "PUMA value = average of its tracts, weighted by non-institutional population = %.2f.",
+      sep = "\n"),
+      ex_tract$NAMELSAD, tract_value, h_ex, puma_value),
+    theme = theme(plot.caption = element_text(hjust = 0, size = 9))) &
+  theme(legend.position = "bottom",
+        legend.box = "horizontal",
+        legend.justification = "left",
+        legend.text = element_text(size = 8),
+        legend.title = element_text(size = 8))
+```
+
+```         
+```
+
 # Variables added {.unnumbered}
 
 | Variable | Meaning |
-|------------------------------------------|------------------------------|
+|----|----|
 | `prison_exp_h1`, `_h5`, `_h10`, `_h25`, `_h50`, `_h100` | distance-decay exposure, every prison counts equally (h = 25 is the main measure) |
 | `prison_exp_cap_h1` … `_h100` | same, prisons weighted by capacity in thousands of beds; prisons with unknown capacity left out |
 | `num_prisons_in_puma`, `prison_present_in_puma` | prisons inside the PUMA boundary; any (0/1) |

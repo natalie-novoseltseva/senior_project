@@ -24,7 +24,8 @@ knitr:
 
 # About this qmd
 
-This qmd includes the national analysis: all 2,462 PUMAs in the 50 states and DC. 
+This qmd includes the national analysis: all 2,462 PUMAs in the 50
+states and DC.
 
 It reads two saved files and joins them:
 
@@ -41,15 +42,12 @@ Outcomes:
 -   `pct_divorced_past_yr`: % of ever-married people who divorced in the
     past year, pooled 2022–2024 ACS
 
-Exposure: distance-decay exposure to open state and federal prisons, Σ exp(−d/h) over all prisons, built for each tract and averaged over the PUMA's tracts with non-institutional population as weights. The main measure is h = 10 km (?); h = 1, 5 and 25 km, the number of prisons inside the PUMA and any prison inside the PUMA are reported alongside it.
-
-Sections:
-
-1.  Descriptives: summary statistics, maps, correlations and unadjusted group comparisons
-2.  Staged OLS models (M1 to M3), SEs clustered by state
-3.  Spatial diagnostics: Moran's I on the outcomes and on the M3 residuals
-4.  Spatial models: SEM and SDEM, model checks
-5
+Exposure: distance-decay exposure to open state and federal prisons, Σ
+exp(−d/h) over all prisons, built for each tract and averaged over the
+PUMA's tracts with non-institutional population as weights. The main
+measure is h = 10 km (?); h = 1, 5 and 25 km, the number of prisons
+inside the PUMA and any prison inside the PUMA are reported alongside
+it.
 
 # Setup
 
@@ -64,6 +62,8 @@ library(spdep)
 library(spatialreg)
 library(tigris)
 library(patchwork)
+library(marginaleffects)
+library(mgcv)
 
 options(tigris_use_cache = TRUE)
 set.seed(2024)
@@ -73,31 +73,30 @@ set.seed(2024)
 
 ```{r}
 #| label: data-load
-# Exposure measures from processing_prison_exposure.qmd, outcomes and controls (with boundaries)
-# from processing_national_pumas_2022_2024.qmd
+# Exposure measures from processing_prison_exposure.qmd, outcomes and controls (with boundaries) from processing_national_pumas_2022_2024.qmd
 exposure <- read_csv("data/final/puma_prison_exposure.csv",
                      col_types = cols(GEOID20 = col_character()))
 
 puma_geo <- st_read("data/final/national_puma_dataset_2022_2024.gpkg", quiet = TRUE) %>%
-  select(-any_of(setdiff(names(exposure), "GEOID20"))) %>%   # avoid .x/.y if the gpkg already has exposure columns
+  select(-any_of(setdiff(names(exposure), "GEOID20"))) %>%   
   left_join(exposure, by = "GEOID20")
 
 puma_df <- puma_geo %>% st_drop_geometry()
 
 nrow(puma_df)   # 2462
 
-# Outcomes and their labels, used throughout
+# Outcomes and their labels
 outcomes <- c(
   overdose_rate_2022_2024 = "Overdose deaths per 100,000",
   pct_divorced_past_yr    = "% of ever-married divorced in past year"
 )
 
-# Lower 48 for maps (Alaska and Hawaii would stretch the map); projected for correct shapes
+# Lower 48 for maps (Alaska and Hawaii are not included)
 puma_geo_l48 <- puma_geo %>%
   filter(!state_fips %in% c("02", "15")) %>%
   st_transform(5070)
 
-# Open state and federal prisons, for plotting on the maps
+# Open state and federal prisons
 prisons <- st_read("data/raw/prison-boundaries-1-geojson.geojson", quiet = TRUE) %>%
   st_make_valid() %>%
   filter(STATUS == "OPEN", TYPE %in% c("STATE", "FEDERAL")) %>%
@@ -131,7 +130,7 @@ puma_df %>%
   fmt_number(columns = c(mean, sd, min, median, max), decimals = 2) %>%
   tab_header(title = "Summary statistics, PUMAs (2022–2024)")
 
-table(puma_df$prison_present_in_puma, useNA = "ifany")   # PUMAs with / without a prison inside
+table(puma_df$prison_present_in_puma, useNA = "ifany")  #PUMAs with/without a prison inside
 ```
 
 ## Maps
@@ -152,13 +151,13 @@ region_map <- tigris::states(cb = TRUE, year = 2020, progress_bar = FALSE) %>%
   group_by(region) %>%
   summarise()
 
-# Pieces shared by the maps; add them with "+"
+# Pieces shared by the maps
 map_theme    <- list(theme_void(), theme(plot.title = element_text(face = "bold")))
 region_layer <- geom_sf(data = region_map, fill = NA, colour = "black", linewidth = 0.4)
 prison_layer <- geom_sf(data = prisons, size = 0.5, colour = "deepskyblue3", alpha = 0.7)
 ```
 
-### Outcomes (add maps by years)
+### Outcomes
 
 ```{r}
 #| label: map-overdose
@@ -173,7 +172,7 @@ ggplot(puma_geo_l48) +
 
 ```{r}
 #| label: map-overdose-years
-# One map per year, same colour scale so the years can be compared
+# one map per year
 puma_geo_l48 %>%
   select(GEOID20, overdose_rate_2022, overdose_rate_2023, overdose_rate_2024) %>%
   pivot_longer(starts_with("overdose_rate_"), names_to = "year", values_to = "rate",
@@ -188,7 +187,14 @@ puma_geo_l48 %>%
   map_theme
 ```
 
-When we look at the overdose rates for each year separately, we see that 2024 has much lower rates across the whole country (a drop of about 24%). A quick google search confirms this and attributes it to new state policies and access to naloxone (narcan). This makes me wonder whether pooling all these years into one dataset is still okay, and whether I should find a way to also control for access to naloxone or for drug/healthcare policies at the state level(or state fixed effects are enough)?
+When we look at the overdose rates for each year separately, we see that
+2024 has much lower rates across the whole country (a drop of about
+24%). A quick google search confirms this and attributes it to new state
+policies and access to nalaxone (narcan). This makes me wonder whether
+pooling all these years into one dataset is still okay, and whether I
+should find a way to also control for access to nalaxone or for
+drug/healthcare policies at the state level(or state fixed effects are
+enough)?
 
 ```{r}
 #| label: map-divorce
@@ -237,7 +243,15 @@ ggplot() +
 
 Exposure at the four decay scales (h=1, h=5, h=10, h=25)
 
-I am still conflicted about which of these four should be “the main measure”... I know for sure that it is not going to be 25 km, because that is too far and does not really make sense. Conceptually, h = 1 and h = 5 make the most sense to me, but because few such places exist, I am wondering whether it makes sense to use them. Also, when running the models, we can see that the effect and its significance fade/weaken as h increases, so maybe I actually need all of them...?
+I am still conflicted about which of these four should be “the main
+measure”... I know for sure that it is not going to be 25 km, because
+that is too far and does not really make sense. Conceptually, h = 1 and
+h = 5 make the most sense to me, but because few such places exist, I am
+wondering whether it makes sense to use them. Also, when running the
+models, we can see that the effect and its significance fade/weaken as h
+increases, so maybe I actually need all of them...?
+
+Distance-based exposure measures:
 
 ```{r}
 #| label: map-exposure
@@ -307,11 +321,16 @@ puma_geo_l48 %>%
   map_theme
 ```
 
-From the maps and the test below, it is evident that these two are actually not that different. So I think I should either choose the number of prisons, since it is the more informative measure, or just discuss them as a pair of count-based measures, basically in contrast to the distance-decay group.
+From the maps and the tests below, it is evident that these two are
+actually not that different. So I think I should either choose the
+number of prisons, since it is the more informative measure, or just
+discuss them as a pair of count-based measures, basically in contrast to
+the distance-decay group.
 
 ### Settlement geography
 
-These are the variables that go into M2 (the model specification, which includes area/population characteristics). 
+These are the variables that go into M2 (the model specification, which
+includes area/population characteristics).
 
 ```{r}
 #| label: map-geography
@@ -368,7 +387,10 @@ puma_geo_l48 %>%
 
 ```
 
-Based on this definition, we end up with too few fully rural pumas, so I think it makes sense to proceed with the non-metro PUMAs and use the variable pct_pop_nonmetro both in the models and for filtering the rural subset.
+Based on this definition, we end up with too few fully rural pumas, so I
+think it makes sense to proceed with the non-metro PUMAs and use the
+variable pct_pop_nonmetro both in the models and for filtering the rural
+subset.
 
 ## Correlations
 
@@ -415,7 +437,11 @@ ggplot(cor_long, aes(var1, var2, fill = rho)) +
 
 ## Group comparisons
 
-This section shows unadjusted comparisons of the outcomes across exposure groups. Prison presence gives two groups, and the number of prisons gives three (0, 1, 2+). Each decay measure is split into an "unexposed" group (exposure below 0.01, meaning no prison anywhere near where people live) and four equal-sized groups of the exposed PUMAs.
+This section shows unadjusted comparisons of the outcomes across
+exposure groups. Prison presence gives two groups, and the number of
+prisons gives three (0, 1, 2+). Each decay measure is split into an
+"unexposed" group (exposure below 0.01, meaning no prison anywhere near
+where people live) and four equal-sized groups of the exposed PUMAs.
 
 ```{r}
 #| label: groupings
@@ -492,7 +518,10 @@ group_stats %>%
   tab_header(title = "Outcomes by prison exposure group")
 ```
 
-The differences in means actually look promising! Pumas with prisons show higher mean rates of both overdose and divorce than Pumas without prisons. In addition, the distance-decay measures show that as exposure increases, the means for both overdose and divorce also increase.
+The differences in means actually look promising! Pumas with prisons
+show higher mean rates of both overdose and divorce than Pumas without
+prisons. In addition, the distance-decay measures show that as exposure
+increases, the means for both overdose and divorce also increase.
 
 ```{r}
 #| label: group-tests
@@ -502,7 +531,7 @@ tests_presence <- group_long %>%
   group_by(y, g) %>%
   summarise(
     test_means = "Welch t-test",
-    difference = diff(t.test(value ~ droplevels(group))$estimate),   # prison minus no prison
+    difference = diff(t.test(value ~ droplevels(group))$estimate),   #prison minus no prison
     p_means    = t.test(value ~ droplevels(group))$p.value,
     test_ranks = "Wilcoxon",
     p_ranks    = wilcox.test(value ~ droplevels(group))$p.value,
@@ -521,7 +550,7 @@ tests_ordered <- group_long %>%
     p_means    = anova(lm(value ~ droplevels(group)))$`Pr(>F)`[1],
     test_ranks = "Kruskal-Wallis",
     p_ranks    = kruskal.test(value ~ droplevels(group))$p.value,
-    p_trend    = tidy(lm(value ~ as.integer(droplevels(group))))$p.value[2],   # groups as 1, 2, 3, ...
+    p_trend    = tidy(lm(value ~ as.integer(droplevels(group))))$p.value[2],   
     .groups = "drop"
   )
 
@@ -543,12 +572,18 @@ test_results %>%
 subtitle = "Difference = with prison minus without (two-group comparisons only)")
 ```
 
-These tests check whether the outcomes differ across groups. For the two-group comparison (prison vs. no prison), we used a Welch t-test for the means and a Wilcoxon rank-sum test for the whole distributions. For the groupings with more than two groups, we used ANOVA and Kruskal-Wallis, plus a linear trend test across the ordered groups. These tests ignore the controls and assume that PUMAs are independent (they are not), so they are descriptive only.
+These tests check whether the outcomes differ across groups. For the
+two-group comparison (prison vs. no prison), we used a Welch t-test for
+the means and a Wilcoxon rank-sum test for the whole distributions. For
+the groupings with more than two groups, we used ANOVA and
+Kruskal-Wallis, plus a linear trend test across the ordered groups.
+These tests ignore the controls and assume that PUMAs are independent
+(they are not), so they are descriptive only.
 
 ### Within metro and non-metro PUMAs
 
 The same prison vs. no prison comparison, separately for metro and
-non-metro PUMAs. 
+non-metro PUMAs.
 
 ```{r}
 #| label: group-stratified
@@ -583,22 +618,29 @@ stratified %>%
   tab_header(title = "Prison vs. no prison, within metro and non-metro PUMAs (unadjusted)")
 ```
 
-I think this is actually interesting, but unfortunately it contradicts my initial theory. First of all, there are more prisons in urban/metropolitan areas (which makes sense given the way we define metro/non-metro). However, what is more important is that the means are actually lower (for overdose) or not significantly different (for divorce) in the rural PUMAs with prisons.
+I think this is actually interesting, but unfortunately it contradicts
+my initial theory. First of all, there are more prisons in
+urban/metropolitan areas (which makes sense given the way we define
+metro/non-metro). However, what is more important is that the means are
+actually lower (for overdose) or not significantly different (for
+divorce) in the rural PUMAs with prisons.
 
 # OLS MODELS
 
-Each model has one exposure measure. Controls are added in stages so we can see how much the exposure coefficient moves at each step. Standard errors for all of the models are clustered by state
+Each model has one exposure measure. Controls are added in stages so we
+can see how much the exposure coefficient moves at each step. Standard
+errors for all of the models are clustered by state
 
-| Model | Adds |
-|-----------------|-------------------------------------------------------|
-| M1 | nothing (exposure only) |
-| M2 | settlement geography: log density, % non-metro, log population |
-| M3a | M2 + economic: % unemployed, log median income |
-| M3b | M2 + education: % bachelor's or more |
-| M3c | M2 + race: % non-White |
-| M3d | M2 + all of the above |
-| M3 | M3d + state fixed effects|
-| M3-div | M3d + Census division fixed effects |
+| Model  | Adds                                                           |
+|--------|----------------------------------------------------------------|
+| M1     | nothing (exposure only)                                        |
+| M2     | settlement geography: log density, % non-metro, log population |
+| M3a    | M2 + economic: % unemployed, log median income                 |
+| M3b    | M2 + education: % bachelor's or more                           |
+| M3c    | M2 + race: % non-White                                         |
+| M3d    | M2 + all of the above                                          |
+| M3     | M3d + state fixed effects                                      |
+| M3-div | M3d + Census division fixed effects                            |
 
 ## Setup and fitting
 
@@ -709,13 +751,15 @@ results <- all_models %>%
 
 ## All stages, by exposure
 
-Each table is one exposure measure across all model stages, so we can see how β, its standard error and R² change as controls are added.
+Each table is one exposure measure across all model stages, so we can
+see how β, its standard error and R² change as controls are added.
 
 ### Overdose deaths per 100,000
 
 h = 1 km:
 
-Positive association between the overdose rate and prison_exp_h1, significant under all specifications.
+Positive association between the overdose rate and prison_exp_h1,
+significant under all specifications.
 
 ```{r}
 #| label: p4-staged-overdose
@@ -729,7 +773,8 @@ etable(models_od, fitstat = ~ r2 + n, digits = 3)
 
 h = 5 km:
 
-Positive association between the overdose rate and prison_exp_h5, NOT significant under any specification.
+Positive association between the overdose rate and prison_exp_h5, NOT
+significant under any specification.
 
 ```{r}
 #| label: p4-staged-overdose-h5
@@ -743,7 +788,8 @@ etable(models_od, fitstat = ~ r2 + n, digits = 3)
 
 h = 10 km:
 
-Positive association between the overdose rate and prison_exp_h10, NOT significant under any specification.
+Positive association between the overdose rate and prison_exp_h10, NOT
+significant under any specification.
 
 ```{r}
 #| label: p4-staged-overdose-h10
@@ -757,7 +803,8 @@ etable(models_od, fitstat = ~ r2 + n, digits = 3)
 
 Number of prisons in the PUMA:
 
-Positive association between the overdose rate and num_prisons_in_puma, NOT significant under full specifications.
+Positive association between the overdose rate and num_prisons_in_puma,
+NOT significant under full specifications.
 
 ```{r}
 #| label: p4-staged-overdose-count
@@ -771,7 +818,8 @@ etable(models_od, fitstat = ~ r2 + n, digits = 3)
 
 Any prison in the PUMA:
 
-Positive association between the overdose rate and prison_present_in_puma, significant under all specifications.
+Positive association between the overdose rate and
+prison_present_in_puma, significant under all specifications.
 
 ```{r}
 #| label: p4-staged-overdose-presence
@@ -791,7 +839,8 @@ From M3d on, the divorce models also control for religious adherence
 
 h = 1 km:
 
-Positive association between the divorce rate and prison_exp_h1, significant under all specifications.
+Positive association between the divorce rate and prison_exp_h1,
+significant under all specifications.
 
 ```{r}
 #| label: p4-staged-divorce
@@ -805,7 +854,8 @@ etable(models_div, fitstat = ~ r2 + n, digits = 3)
 
 h = 5 km:
 
-Positive association between the divorce rate and prison_exp_h5, significant under all specifications.
+Positive association between the divorce rate and prison_exp_h5,
+significant under all specifications.
 
 ```{r}
 #| label: p4-staged-divorce-h5
@@ -819,7 +869,8 @@ etable(models_div, fitstat = ~ r2 + n, digits = 3)
 
 h = 10 km:
 
-Positive association between the divorce rate and prison_exp_h10, significant under all specifications.
+Positive association between the divorce rate and prison_exp_h10,
+significant under all specifications.
 
 ```{r}
 #| label: p4-staged-divorce-h10
@@ -833,7 +884,8 @@ etable(models_div, fitstat = ~ r2 + n, digits = 3)
 
 h = 25 km:
 
-Positive association between the divorce rate and prison_exp_h25, significant only with state and division fixed effects.
+Positive association between the divorce rate and prison_exp_h25,
+significant only with state and division fixed effects.
 
 ```{r}
 #| label: p4-staged-divorce-h25
@@ -847,7 +899,8 @@ etable(models_div, fitstat = ~ r2 + n, digits = 3)
 
 Number of prisons in the PUMA:
 
-Positive association between the divorce rate and num_prisons_in_pum, significant only with division fixed effects.
+Positive association between the divorce rate and num_prisons_in_pum,
+significant only with division fixed effects.
 
 ```{r}
 #| label: p4-staged-divorce-count
@@ -861,7 +914,8 @@ etable(models_div, fitstat = ~ r2 + n, digits = 3)
 
 Any prison in the PUMA:
 
-Positive association between the divorce rate and prison_present_in_puma, significant under all specifications.
+Positive association between the divorce rate and
+prison_present_in_puma, significant under all specifications.
 
 ```{r}
 #| label: p4-staged-divorce-presence
@@ -874,8 +928,6 @@ etable(models_div, fitstat = ~ r2 + n, digits = 3)
 ```
 
 ## All exposure measures
-
-`% change` is relative to M1. It’s misleading when β is negative (a more negative β shows up as a negative change), so read it together with β.
 
 ```{r}
 #| label: p4-summary-table
@@ -895,56 +947,149 @@ results %>%
              subtitle = "Continuous exposures per SD; presence = with vs. without; SEs clustered by state. Shaded: p < 0.05")
 ```
 
-OLS shows an effect on the divorce rate, which seems to be stronger at lower h. The effect of prisons on overdose is only significant with the distance-decay measure at h = 1 and with both count-based measures.
+OLS shows an effect on the divorce rate, which seems to be stronger at
+lower h. The effect of prisons on overdose is only significant with the
+distance-decay measure at h = 1 and with both count-based measures.
 
-## Which control group moves β
+## Change in exposure coefficient as controls are added
 
 ```{r}
-#| label: p4-control-groups
-results %>%
-  filter(spec %in% c("M2", "M3a", "M3b", "M3c", "M3d", "M3", "M3-div")) %>%
-  select(outcome, exposure, spec, estimate) %>%
-  pivot_wider(names_from = spec, values_from = estimate) %>%
-  arrange(outcome, exposure) %>%
-  gt(groupname_col = "outcome") %>%
-  fmt_number(columns = -c(outcome, exposure), decimals = 3) %>%
-  cols_label(M3a = "M2 + economic", M3b = "M2 + education", M3c = "M2 + race",
-             M3d = "M2 + all", M3 = "+ state FE", `M3-div` = "+ division FE") %>%
-  tab_header(title = "Exposure coefficient (β) as each control group is added")
+#| label: stepwise-h5
+# three versions: overdose; divorce with total religious adherence; divorce with the four religious families instead. Controls are added one per step (cumulative), then state FE
+
+ctrl_relig_families <- c("pct_evangelical", "pct_catholic", "pct_mainline", "pct_black_protestant")
+
+ctrl_order <- list(
+  overdose         = c(ctrl_geo, ctrl_econ, ctrl_educ, ctrl_race),
+  divorce_total    = c(ctrl_geo, ctrl_econ, ctrl_educ, ctrl_race, "pct_religious"),
+  divorce_families = c(ctrl_geo, ctrl_econ, ctrl_educ, ctrl_race, ctrl_relig_families)
+)
+
+# outcome for each version
+y_of <- c(overdose         = "overdose_rate_2022_2024",
+          divorce_total    = "pct_divorced_past_yr",
+          divorce_families = "pct_divorced_past_yr")
+
+ctrl_names <- c(log_pop_density      = "Log population density",
+                pct_pop_nonmetro     = "% population in non-metro tracts",
+                log_pop              = "Log population",
+                pct_unemployed       = "% unemployed",
+                log_medhhinc         = "Log median household income",
+                pct_bachelors_plus   = "% bachelor's degree or higher",
+                pct_nonwhite         = "% non-white",
+                pct_religious        = "% religious adherents (all)",
+                pct_evangelical      = "% evangelical Protestant",
+                pct_catholic         = "% Catholic",
+                pct_mainline         = "% mainline Protestant",
+                pct_black_protestant = "% Black Protestant")
+
+x_step <- "prison_exp_h5"  
+
+# one row per step: the controls included so far, then a final step with state FE
+stepwise <- imap_dfr(ctrl_order, ~ tibble(
+    version  = .y,
+    y        = y_of[[.y]],
+    step     = 0:(length(.x) + 1),
+    added    = c("Exposure only", ctrl_names[.x], "State fixed effects"),
+    controls = c(list(character(0)), accumulate(.x, c), list(.x)),
+    fe       = c(rep(NA_character_, length(.x) + 1), "state_fips")
+  )) %>%
+  mutate(
+    formula = pmap_chr(list(y, controls, fe),
+                       ~ str_c(..1, " ~ ", str_c(c(x_step, ..2), collapse = " + "),
+                               if_else(is.na(..3), "", str_c(" | ", ..3)))),
+    model   = map2(formula, y, ~ feols(as.formula(.x), data = model_data[[.y]],
+                                       cluster = ~state_fips)),
+    coef    = map(model, ~ tidy(.x, conf.int = TRUE) %>% filter(term == x_step)),
+    r2      = map_dbl(model, ~ r2(.x, "r2")),
+    n       = map_int(model, nobs)
+  ) %>%
+  unnest(coef) %>%
+  group_by(version) %>%
+  mutate(change_prev = estimate - lag(estimate),               
+         pct_from_m1 = 100 * (estimate - first(estimate)) / abs(first(estimate))) %>%
+  ungroup()
 ```
 
 ```{r}
-#| label: p4-coefplot
-#| fig-height: 8
-results %>%
-  filter(spec %in% c("M1", "M2", "M3d", "M3", "M3-div")) %>%
-  ggplot(aes(x = estimate, y = fct_rev(exposure), colour = spec)) +
-  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
-  geom_pointrange(aes(xmin = conf.low, xmax = conf.high),
-                  position = position_dodge(width = 0.7), size = 0.3) +
-  facet_wrap(~ outcome, scales = "free_x") +
-  scale_colour_brewer(palette = "Dark2", name = "Model") +
-  labs(x = "β with 95% CI (SEs clustered by state)", y = NULL,
-       title = "Prison exposure coefficients across model stages") +
-  theme_minimal() +
-  theme(legend.position = "bottom")
+#| label: stepwise-h5-overdose
+
+# overdose table
+stepwise %>%
+  filter(version == "overdose") %>%
+  select(step, added, estimate, std.error, p.value, conf.low, conf.high, change_prev, pct_from_m1, r2) %>%
+  gt() %>%
+  cols_label(step = "Step", added = "Added", estimate = "β", std.error = "SE", p.value = "p",
+             conf.low = "95% CI low", conf.high = "95% CI high",
+             change_prev = "Change from previous step", pct_from_m1 = "% change from step 0",
+             r2 = "R²") %>%
+  fmt_number(columns = c(estimate, std.error, conf.low, conf.high, change_prev), decimals = 3) %>%
+  fmt_number(columns = p.value, decimals = 4) %>%
+  fmt_number(columns = pct_from_m1, decimals = 1) %>%
+  fmt_number(columns = r2, decimals = 3) %>%
+  sub_missing(missing_text = "") %>%
+  tab_header(title = "Overdose deaths per 100,000: exposure coefficient as controls are added one at a time")
+```
+
+```{r}
+#| label: stepwise-h5-divorce
+
+# divorce table
+stepwise %>%
+  filter(version == "divorce_total") %>%
+  select(step, added, estimate, std.error, p.value, conf.low, conf.high, change_prev, pct_from_m1, r2) %>%
+  gt() %>%
+  cols_label(step = "Step", added = "Added", estimate = "β", std.error = "SE", p.value = "p",
+             conf.low = "95% CI low", conf.high = "95% CI high",
+             change_prev = "Change from previous step", pct_from_m1 = "% change from step 0",
+             r2 = "R²") %>%
+  fmt_number(columns = c(estimate, std.error, conf.low, conf.high, change_prev), decimals = 3) %>%
+  fmt_number(columns = p.value, decimals = 4) %>%
+  fmt_number(columns = pct_from_m1, decimals = 1) %>%
+  fmt_number(columns = r2, decimals = 3) %>%
+  sub_missing(missing_text = "") %>%
+  tab_header(title = "% of ever-married divorced in past year: exposure coefficient as controls are added one at a time"
+             )
+```
+
+```{r}
+#| label: stepwise-h5-divorce-families
+
+# divorce table (religion - 4 variables)
+stepwise %>%
+  filter(version == "divorce_families") %>%
+  select(step, added, estimate, std.error, p.value, conf.low, conf.high, change_prev, pct_from_m1, r2) %>%
+  gt() %>%
+  cols_label(step = "Step", added = "Added", estimate = "β", std.error = "SE", p.value = "p",
+             conf.low = "95% CI low", conf.high = "95% CI high",
+             change_prev = "Change from previous step", pct_from_m1 = "% change from step 0",
+             r2 = "R²") %>%
+  fmt_number(columns = c(estimate, std.error, conf.low, conf.high, change_prev), decimals = 3) %>%
+  fmt_number(columns = p.value, decimals = 4) %>%
+  fmt_number(columns = pct_from_m1, decimals = 1) %>%
+  fmt_number(columns = r2, decimals = 3) %>%
+  sub_missing(missing_text = "") %>%
+  tab_header(title = "% of ever-married divorced in past year: exposure coefficient as controls are added one at a time")
 ```
 
 # DISTANCE BANDS ANALYSIS/TEST
 
-This was my attempt to illustrate how the effect fades as distance increases. We can see that the effect of prisons on overdose is close to zero at distances of more than 5 km. For divorce, we can see a big drop in the coefficient when the distance increases from 2 km to 5 km, and it continues to decrease as the distance increases.
+This was my attempt to illustrate how the effect fades as distance
+increases. We can see that the effect of prisons on overdose is close to
+zero at distances of more than 5 km. For divorce, we can see a big drop
+in the coefficient when the distance increases from 2 km to 5 km, and it
+continues to decrease as the distance increases.
 
 ```{r}
 #| label: ring-models
 
-# Distance rings (non-overlapping), in order from closest to furthest
+#distance rings
 rings <- c("ring_0_2", "ring_2_5", "ring_5_10", "ring_10_25", "ring_25_50")
 
 ring_labels <- c(ring_0_2 = "0–2 km", ring_2_5 = "2–5 km", ring_5_10 = "5–10 km",
                  ring_10_25 = "10–25 km", ring_25_50 = "25–50 km")
 
-# M3 formula for each outcome (its own controls + state FE), with the exposure
-# swapped for all the rings
+# M3 formula for each outcome (its own controls + state FE), with the exposure swapped for all the rings
 ring_models <- all_models %>%
   filter(spec == "M3", x == "prison_exp_h10") %>%
   distinct(y, formula) %>%
@@ -960,7 +1105,7 @@ ring_models %>% pull(model) %>% etable()
 ```{r}
 #| label: ring-n
 
-# How many PUMAs have any prison in each ring (same 2,462 PUMAs for both outcomes)
+# how many PUMAs have any prison in each ring 
 ring_n <- model_data[["overdose_rate_2022_2024"]] %>%
   summarise(across(all_of(rings), ~ sum(.x > 0))) %>%
   pivot_longer(everything(), names_to = "term", values_to = "n_pumas")
@@ -973,7 +1118,7 @@ ring_n
 #| fig-width: 10
 #| fig-height: 5.5
 
-# Axis labels with the number of PUMAs under each ring
+# axis labels with the number of PUMAs under each ring
 ring_axis <- ring_n %>%
   mutate(axis_label = paste0(ring_labels[term], "\n(n = ", n_pumas, ")")) %>%
   pull(axis_label)
@@ -989,7 +1134,7 @@ ring_models %>%
   left_join(ring_n, by = "term") %>%
   mutate(ring    = factor(paste0(ring_labels[term], "\n(n = ", n_pumas, ")"),
                           levels = ring_axis),
-         outcome = factor(outcome_panels[y], levels = outcome_panels)) %>%   # overdose first
+         outcome = factor(outcome_panels[y], levels = outcome_panels)) %>%   
   ggplot(aes(x = ring, y = estimate)) +
   geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
   geom_pointrange(aes(ymin = conf.low, ymax = conf.high)) +
@@ -1005,15 +1150,595 @@ ring_models %>%
   theme(plot.caption = element_text(hjust = 0))
 ```
 
+# LOCAL MEASURES (h=1,5)
+
+```{r}
+#| label: fig-influence-dist
+#| fig-height: 4
+
+# one row per PUMA x outcome x exposure (raw exposure)
+local_long <- puma_df %>%
+  select(GEOID20, all_of(names(outcomes)), prison_exp_h1, prison_exp_h5) %>%
+  pivot_longer(all_of(names(outcomes)), names_to = "y", values_to = "value_y") %>%
+  pivot_longer(c(prison_exp_h1, prison_exp_h5), names_to = "x", values_to = "exposure") %>%
+  drop_na(value_y) %>%
+  mutate(h = exposures[x], outcome = outcomes[y])
+
+# histogram
+local_long %>%
+  distinct(GEOID20, h, exposure) %>%
+  ggplot(aes(exposure)) +
+  geom_histogram(bins = 60, fill = "grey40") +
+  scale_x_sqrt() +
+  facet_wrap(~ h, scales = "free") +
+  labs(x = "Exposure (square-root scale)", y = "PUMAs",
+       title = "Local exposure: most PUMAs are near zero") +
+  theme_minimal()
+```
+
+Both distributions are skewed to the right, even on a square-root scale, which confirms the issue identified earlier: very few PUMAs have high exposure on the very local measures, especially h = 1 km (however, this is expected, because at h = 1 km exposure falls off so quickly with distance)
+
+```{r}
+#| label: fig-exposure-scatter-all
+#| fig-width: 12
+#| fig-height: 6.5
+
+all_long <- model_data %>%
+  imap_dfr(~ .x %>%
+             select(GEOID20, value_y = all_of(.y), all_of(names(h_vars))) %>%
+             mutate(y = .y)) %>%
+  pivot_longer(all_of(names(h_vars)), names_to = "x", values_to = "exposure") %>%
+  mutate(h       = factor(h_vars[x], levels = h_vars),         # keep h = 1, 5, 10, 25 in order
+         outcome = factor(outcomes[y], levels = outcomes))
+
+ggplot(all_long, aes(exposure, value_y)) +
+  geom_point(alpha = 0.25, size = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, colour = "black", linewidth = 0.7) +
+  geom_smooth(method = "loess", se = FALSE, colour = "#B23A1E", linewidth = 0.7) +
+  facet_grid(outcome ~ h, scales = "free", labeller = label_wrap_gen(25)) +
+  labs(x = "Exposure (SD)", y = NULL,
+       title = "Outcome vs. prison exposure, all decay distances (no controls)",
+       caption = "Black: straight line; red: loess smooth.") +
+  theme_minimal()
+```
+
+The relationship between prison exposure and divorce can be described as linear. Even though the straight and smoothed lines diverge for some of the exposure measures, the relationship becomes more linear once the GAM accounts for the controls.
+
+The relationship between prison exposure and overdose is not linear: the slope is largely driven by a few urban PUMAs with both very high exposure and very high overdose rates, which is also supported by the Cook’s distance and GAM results below.
 
 
-# SPATIAL DIAGNOSTICS 
+## Cook's distance
 
-OLS assumes that PUMAs are independent of each other. But if neighboring pumas have similar residuals, this assumption doesn’t hold: the standard errors are wrong, and the model is missing something regional. Here we check this for M3 (all controls + state fixed effects) with all six exposure measures. 
+```{r}
+#| label: influence-setup
+# control strings for each outcome
+ctrl_str <- c(overdose_rate_2022_2024 = str_c(ctrl_all,     collapse = " + "),
+              pct_divorced_past_yr    = str_c(ctrl_all_div, collapse = " + "))
+
+# exposures (h = 1, 5 and 10 km)
+infl_x <- c("prison_exp_h1", "prison_exp_h5", "prison_exp_h10")
+
+# fit M3 for every outcome x exposure pair (2 x 3 = 6 models)
+infl_models <- expand_grid(y = names(outcomes), x = infl_x) %>%
+  mutate(
+    # write the formula as text: outcome ~ exposure + controls + state dummies
+    formula = str_c(y, " ~ ", x, " + ", ctrl_str[y], " + factor(state_fips)"),
+    # fit the model on the sample for that outcome
+    model   = map2(formula, y, ~ lm(as.formula(.x), data = model_data[[.y]])),
+    # get Cook's distance and leverage for each PUMA, keep only the columns I need
+    infl    = map2(model, y, ~ augment(.x, data = model_data[[.y]]) %>%
+                     select(GEOID20, name = NAMELSAD20, state = STUSPS20,
+                            all_of(infl_x), cooks = .cooksd, leverage = .hat) %>%
+                     mutate(row = row_number())),
+    # usual cutoff for "influential": Cook's distance above 4/n
+    cutoff  = map_dbl(model, ~ 4 / nobs(.x))
+  )
+
+# one long table
+infl_long <- infl_models %>%
+  select(y, x, cutoff, infl) %>%
+  unnest(infl) %>%
+  mutate(exposure_z = case_when(x == "prison_exp_h1"  ~ prison_exp_h1,
+                                x == "prison_exp_h5"  ~ prison_exp_h5,
+                                x == "prison_exp_h10" ~ prison_exp_h10),
+         outcome    = outcomes[y],
+         h          = exposures[x]) %>%
+  select(-all_of(infl_x))
+
+# summary for each model
+infl_long %>%
+  group_by(outcome, h) %>%
+  summarise(n_flagged = sum(cooks > cutoff),
+            share_flagged = mean(cooks > cutoff),
+            top10_share_of_total_cooks = sum(sort(cooks, decreasing = TRUE)[1:10]) / sum(cooks),
+            .groups = "drop")
+```
+
+```{r}
+#| label: influence-refit
+# refit M3 (feols, clustered SEs) on: all PUMAs; without PUMAs above 4/n; without the top 1% of exposure
+flagged <- infl_long %>% filter(cooks > cutoff) %>% distinct(y, x, GEOID20)
+
+infl_grid <- expand_grid(y = names(outcomes), x = infl_x)
+
+influence_samples <- bind_rows(
+  infl_grid %>%
+    mutate(sample = "All PUMAs",
+           data   = map(y, ~ model_data[[.x]])),
+  infl_grid %>%
+    mutate(sample = "Without Cook's D > 4/n",
+           data   = map2(y, x, ~ anti_join(model_data[[.x]],
+                                           flagged[flagged$y == .x & flagged$x == .y, ],
+                                           by = "GEOID20"))),
+  infl_grid %>%
+    mutate(sample = "Without top 1% exposure",
+           data   = map2(y, x, ~ model_data[[.x]][model_data[[.x]][[.y]] <=
+                                                    quantile(model_data[[.x]][[.y]], 0.99), ]))
+)
+
+influence_check <- influence_samples %>%
+  mutate(
+    model = pmap(list(y, x, data), ~ feols(as.formula(str_c(..1, " ~ ", ..2, " + ", ctrl_str[..1],
+                                                              " | state_fips")),
+                                           data = ..3, cluster = ~state_fips)),
+    n     = map_int(model, nobs),
+    coef  = map2(model, x, ~ tidy(.x, conf.int = TRUE) %>% filter(term == .y))
+  ) %>%
+  select(y, x, sample, n, coef) %>%
+  unnest(coef) %>%
+  mutate(outcome = outcomes[y], h = exposures[x],
+         sample  = factor(sample, levels = c("All PUMAs", "Without Cook's D > 4/n",
+                                             "Without top 1% exposure"))) %>%
+  arrange(outcome, h, sample)
+
+influence_check %>%
+  select(outcome, h, sample, n, estimate, std.error, p.value) %>%
+  gt(groupname_col = c("outcome", "h")) %>%
+  fmt_number(columns = c(estimate, std.error), decimals = 3) %>%
+  fmt_number(columns = p.value, decimals = 4) %>%
+  tab_header(title = "Prison coefficient with and without influential PUMAs")
+```
+
+Based on the Cook's distance check, the divorce results are not very affected by influential PUMAs (the coefficient stays similar and significant when the influential PUMAs or the 1% most exposed PUMAs are removed). The overdose results are the opposite. At h = 1 km, the coefficient stays positive when the influential PUMAs are removed, but it drops to almost zero when the 25 most exposed PUMAs are removed, so these 25 PUMAs drive the relationship(?). At h = 5 and 10 km the relationship was not significant in the first place, and it disappears in both samples, where outliers/flagged PUMAs are removed.
+
+```{r}
+# PUMAs in the top 1% of exposure, for each h (overdose sample)
+od_mean <- mean(model_data[["overdose_rate_2022_2024"]]$overdose_rate_2022_2024)
+
+top1 <- puma_df %>%
+  semi_join(model_data[["overdose_rate_2022_2024"]], by = "GEOID20") %>%
+  # overdose percentile among all PUMAs (before keeping only the top 1%)
+  mutate(od_percentile = round(100 * percent_rank(overdose_rate_2022_2024))) %>%
+  pivot_longer(all_of(infl_x), names_to = "x", values_to = "exposure") %>%
+  group_by(x) %>%
+  filter(exposure >= quantile(exposure, 0.99)) %>%
+  ungroup() %>%
+  mutate(h = factor(exposures[x], levels = exposures))
+
+# how many of them are high-overdose (top quarter) and how many are rural
+top1 %>%
+  group_by(h) %>%
+  summarise(n_pumas         = n(),
+            n_high_overdose = sum(od_percentile > 75),
+            mean_overdose   = mean(overdose_rate_2022_2024),
+            n_rural         = sum(pct_pop_nonmetro > 50))
+
+# the list
+top1 %>%
+  arrange(h, desc(overdose_rate_2022_2024)) %>%
+  select(h, NAMELSAD20, STUSPS20, exposure, overdose_rate_2022_2024, od_percentile,
+         pct_pop_nonmetro) %>%
+  gt(groupname_col = "h") %>%
+  cols_label(NAMELSAD20 = "PUMA", STUSPS20 = "State", exposure = "Exposure (raw)",
+             overdose_rate_2022_2024 = "Overdose rate", od_percentile = "Overdose percentile",
+             pct_pop_nonmetro = "% non-metro") %>%
+  fmt_number(columns = c(exposure, overdose_rate_2022_2024, pct_pop_nonmetro), decimals = 1) %>%
+  tab_header(title = "PUMAs in the top 1% of prison exposure",
+             subtitle = str_c("Overdose deaths per 100,000; national mean = ", round(od_mean, 1)))
+```
+
+The list above shows the 25 PUMAs with the highest exposure (for each h), which largely drive the overdose relationship in the national model. Most of them are geographically concentrated in the Northeast, and all of them are urban!
+
+# INTERACTIONS: Rural vs. urban and South vs. the rest
+
+```{r}
+#| label: interaction-setup
+# add a dummy
+# rural = 1 if more than half the population lives in non-metro tracts
+model_data <- map(model_data, ~ .x %>%
+                    mutate(rural = as.integer(pct_pop_nonmetro > 50),
+                           south = as.integer(state_fips %in% south_fips)))
+
+int_x <- names(exposures)   # exposure = all decay distances
+
+map(model_data, ~ count(.x, rural))   # how many PUMAs in each group
+```
+
+## Rural vs. urban
+
+```{r}
+#| label: rural-models
+
+#table with coefficients foe all exposure measures
+rural_models <- expand_grid(y = names(outcomes), x = int_x) %>%
+  mutate(
+    formula = str_c(y, " ~ ", x, " * rural + ", ctrl_str[y], " | state_fips"),
+    model   = map2(formula, y, ~ feols(as.formula(.x), data = model_data[[.y]],
+                                       cluster = ~state_fips)),
+    # Slope of exposure separately for urban (0) and rural (1) PUMAs
+    slopes  = pmap(list(model, x, y), ~ avg_slopes(..1, variables = ..2, by = "rural",
+                                                   newdata = model_data[[..3]]) %>%
+                     as_tibble() %>%
+                     select(rural, estimate, std.error, p.value, conf.low, conf.high)),
+    # Test of the difference = the interaction coefficient
+    diff    = map2(model, x, ~ tidy(.x) %>% filter(term == str_c(.y, ":rural")) %>%
+                     select(diff = estimate, diff_p = p.value))
+  )
+
+rural_results <- rural_models %>%
+  select(y, x, slopes, diff) %>%
+  unnest(slopes) %>%
+  unnest(diff) %>%
+  mutate(outcome = factor(outcomes[y], levels = outcomes),
+         h       = factor(exposures[x], levels = exposures),
+         group   = if_else(rural == 1, "Rural", "Urban"))
+
+rural_results %>%
+  select(outcome, h, group, estimate, std.error, p.value, diff, diff_p) %>%
+  gt(groupname_col = "outcome") %>%
+  fmt_number(columns = c(estimate, std.error, diff), decimals = 3) %>%
+  fmt_number(columns = c(p.value, diff_p), decimals = 4) %>%
+  tab_header(title = "Prison slope for rural and urban PUMAs (full sample, interaction)",
+             subtitle = "diff = rural − urban slope; diff_p = test that they are equal")
+```
+
+The table above shows the prison slope for each exposure measure and its significance in urban and rural PUMAs. For overdose, the rural slope is larger than the urban one for all of the exposures and is statistically significant for three out of four of them (at h = 25 km, p = 0.08). However, the difference between the urban and rural slopes is not statistically significant.
+
+For divorce, the situation is the opposite. The association between prison exposure and divorce is stronger in urban PUMAs, while in rural PUMAs the slope becomes negative and is not significant.
+
+The tables below show the full models for each exposure:
+
+```{r}
+#| label: rural-h1-tables
+# tables for the exposure × rural model, h = 1 km
+term_lab <- c(prison_exp_h1         = "Prison exposure, h = 1 km (per 1 SD)",
+              rural                 = "Rural PUMA (1 = rural)",
+              `prison_exp_h5:rural` = "Exposure × rural",
+              log_pop_density       = "Log population density",
+              pct_pop_nonmetro      = "% population in non-metro tracts",
+              log_pop               = "Log population",
+              pct_unemployed        = "% unemployed",
+              log_medhhinc          = "Log median household income",
+              pct_bachelors_plus    = "% bachelor's degree or more",
+              pct_nonwhite          = "% nonwhite",
+              pct_religious         = "% religious adherents")
+
+rural_h1 <- rural_models %>%
+  filter(x == "prison_exp_h1") %>%
+  mutate(
+    # every coefficient in the model
+    coefs  = map(model, ~ tidy(.x, conf.int = TRUE) %>%
+                   select(-statistic) %>%
+                   mutate(part = "Coefficients",
+                          term = coalesce(term_lab[term], term))),
+    # the prison slope for urban and rural PUMAs (from avg_slopes)
+    groups = map(slopes, ~ .x %>%
+                   mutate(part = "Prison slope by group",
+                          term = if_else(rural == 1, "Slope in rural PUMAs",
+                                                     "Slope in urban PUMAs")) %>%
+                   select(-rural)),
+    # model information
+    fit    = map(model, ~ tibble(part = "Model",
+                                 term = c("PUMAs", "States (fixed effects)", "Within R²"),
+                                 estimate = c(nobs(.x), .x$fixef_sizes[["state_fips"]],
+                                              r2(.x, "wr2")))),
+    #ci written as text here, so the model rows just stay empty
+    rows   = pmap(list(coefs, groups, fit), ~ bind_rows(..1, ..2, ..3) %>%
+                    mutate(ci = if_else(is.na(conf.low), NA_character_,
+                                        sprintf("[%.3f, %.3f]", conf.low, conf.high))) %>%
+                    select(part, term, estimate, std.error, p.value, ci)),
+    tab    = map2(rows, y, ~ .x %>%
+                    gt(groupname_col = "part", rowname_col = "term") %>%
+                    fmt_number(columns = c(estimate, std.error), decimals = 3) %>%
+                    fmt_number(columns = p.value, decimals = 4) %>%
+                    fmt_number(columns = estimate,
+                               rows = term %in% c("PUMAs", "States (fixed effects)"),
+                               decimals = 0) %>%
+                    sub_missing(missing_text = "") %>%
+                    cols_label(estimate = "Estimate", std.error = "SE", p.value = "p",
+                               ci = "95% CI") %>%
+                    tab_header(title = outcomes[.y],
+                               subtitle = "Exposure × rural, h = 1 km, state fixed effects") %>%
+                    tab_source_note("SEs clustered by state. Exposure standardized nationally (mean 0, SD 1)."))
+  )
+
+rural_h1$tab[[1]]   # overdose
+rural_h1$tab[[2]]   # divorce
+```
+
+Prison exposure, h = 1 km - the prison exposure slope for urban PUMAs only
+Rural PUMA - how much higher overdose is in a rural PUMA than in urban one at average exposure(?)
+prison_exp_h1:rural (Exposure × rural) - how much steeper the prison exposure slope is in rural PUMAs than in urban ones.
+Slope in urban PUMAs = Prison exposure, h = 1 km
+Slope in Rural PUMAs = Prison exposure, h = 1 km + prison_exp_h1:rural (Exposure × rural)
+
+```{r}
+#| label: rural-h5-tables
+# Full tables for the exposure × rural model, h = 5 km, one per outcome
+term_lab <- c(prison_exp_h5         = "Prison exposure, h = 5 km (per 1 SD)",
+              rural                 = "Rural PUMA (1 = rural)",
+              `prison_exp_h5:rural` = "Exposure × rural",
+              log_pop_density       = "Log population density",
+              pct_pop_nonmetro      = "% population in non-metro tracts",
+              log_pop               = "Log population",
+              pct_unemployed        = "% unemployed",
+              log_medhhinc          = "Log median household income",
+              pct_bachelors_plus    = "% bachelor's degree or more",
+              pct_nonwhite          = "% nonwhite",
+              pct_religious         = "% religious adherents")
+
+rural_h5 <- rural_models %>%
+  filter(x == "prison_exp_h5") %>%
+  mutate(
+    # every coefficient in the model
+    coefs  = map(model, ~ tidy(.x, conf.int = TRUE) %>%
+                   select(-statistic) %>%
+                   mutate(part = "Coefficients",
+                          term = coalesce(term_lab[term], term))),
+    # the prison slope for urban and rural PUMAs (from avg_slopes)
+    groups = map(slopes, ~ .x %>%
+                   mutate(part = "Prison slope by group",
+                          term = if_else(rural == 1, "Slope in rural PUMAs",
+                                                     "Slope in urban PUMAs")) %>%
+                   select(-rural)),
+    # model information
+    fit    = map(model, ~ tibble(part = "Model",
+                                 term = c("PUMAs", "States (fixed effects)", "Within R²"),
+                                 estimate = c(nobs(.x), .x$fixef_sizes[["state_fips"]],
+                                              r2(.x, "wr2")))),
+    #ci written as text here, so the model rows just stay empty
+    rows   = pmap(list(coefs, groups, fit), ~ bind_rows(..1, ..2, ..3) %>%
+                    mutate(ci = if_else(is.na(conf.low), NA_character_,
+                                        sprintf("[%.3f, %.3f]", conf.low, conf.high))) %>%
+                    select(part, term, estimate, std.error, p.value, ci)),
+    tab    = map2(rows, y, ~ .x %>%
+                    gt(groupname_col = "part", rowname_col = "term") %>%
+                    fmt_number(columns = c(estimate, std.error), decimals = 3) %>%
+                    fmt_number(columns = p.value, decimals = 4) %>%
+                    fmt_number(columns = estimate,
+                               rows = term %in% c("PUMAs", "States (fixed effects)"),
+                               decimals = 0) %>%
+                    sub_missing(missing_text = "") %>%
+                    cols_label(estimate = "Estimate", std.error = "SE", p.value = "p",
+                               ci = "95% CI") %>%
+                    tab_header(title = outcomes[.y],
+                               subtitle = "Exposure × rural, h = 5 km, state fixed effects") %>%
+                    tab_source_note("SEs clustered by state. Exposure standardized nationally (mean 0, SD 1)."))
+  )
+
+rural_h5$tab[[1]]   # overdose
+rural_h5$tab[[2]]   # divorce
+```
+
+```{r}
+#| label: rural-h10-tables
+# Full tables for the exposure × rural model, h = 10 km, one per outcome
+term_lab <- c(prison_exp_h10        = "Prison exposure, h = 10 km (per 1 SD)",
+              rural                 = "Rural PUMA (1 = rural)",
+              `prison_exp_h5:rural` = "Exposure × rural",
+              log_pop_density       = "Log population density",
+              pct_pop_nonmetro      = "% population in non-metro tracts",
+              log_pop               = "Log population",
+              pct_unemployed        = "% unemployed",
+              log_medhhinc          = "Log median household income",
+              pct_bachelors_plus    = "% bachelor's degree or more",
+              pct_nonwhite          = "% nonwhite",
+              pct_religious         = "% religious adherents")
+
+rural_h10 <- rural_models %>%
+  filter(x == "prison_exp_h10") %>%
+    mutate(
+    # every coefficient in the model
+    coefs  = map(model, ~ tidy(.x, conf.int = TRUE) %>%
+                   select(-statistic) %>%
+                   mutate(part = "Coefficients",
+                          term = coalesce(term_lab[term], term))),
+    # the prison slope for urban and rural PUMAs (from avg_slopes)
+    groups = map(slopes, ~ .x %>%
+                   mutate(part = "Prison slope by group",
+                          term = if_else(rural == 1, "Slope in rural PUMAs",
+                                                     "Slope in urban PUMAs")) %>%
+                   select(-rural)),
+    # model information
+    fit    = map(model, ~ tibble(part = "Model",
+                                 term = c("PUMAs", "States (fixed effects)", "Within R²"),
+                                 estimate = c(nobs(.x), .x$fixef_sizes[["state_fips"]],
+                                              r2(.x, "wr2")))),
+    #ci written as text here, so the model rows just stay empty
+    rows   = pmap(list(coefs, groups, fit), ~ bind_rows(..1, ..2, ..3) %>%
+                    mutate(ci = if_else(is.na(conf.low), NA_character_,
+                                        sprintf("[%.3f, %.3f]", conf.low, conf.high))) %>%
+                    select(part, term, estimate, std.error, p.value, ci)),
+    tab    = map2(rows, y, ~ .x %>%
+                    gt(groupname_col = "part", rowname_col = "term") %>%
+                    fmt_number(columns = c(estimate, std.error), decimals = 3) %>%
+                    fmt_number(columns = p.value, decimals = 4) %>%
+                    fmt_number(columns = estimate,
+                               rows = term %in% c("PUMAs", "States (fixed effects)"),
+                               decimals = 0) %>%
+                    sub_missing(missing_text = "") %>%
+                    cols_label(estimate = "Estimate", std.error = "SE", p.value = "p",
+                               ci = "95% CI") %>%
+                    tab_header(title = outcomes[.y],
+                               subtitle = "Exposure × rural, h = 10 km, state fixed effects") %>%
+                    tab_source_note("SEs clustered by state. Exposure standardized nationally (mean 0, SD 1)."))
+    )
+
+rural_h10$tab[[1]]   # overdose
+rural_h10$tab[[2]]   # divorce
+```
+
+```{r}
+#| label: rural-h25-tables
+# Full tables for the exposure × rural model, h = 25 km, one per outcome
+term_lab <- c(prison_exp_h25         = "Prison exposure, h = 25 km (per 1 SD)",
+              rural                 = "Rural PUMA (1 = rural)",
+              `prison_exp_h5:rural` = "Exposure × rural",
+              log_pop_density       = "Log population density",
+              pct_pop_nonmetro      = "% population in non-metro tracts",
+              log_pop               = "Log population",
+              pct_unemployed        = "% unemployed",
+              log_medhhinc          = "Log median household income",
+              pct_bachelors_plus    = "% bachelor's degree or more",
+              pct_nonwhite          = "% nonwhite",
+              pct_religious         = "% religious adherents")
+
+rural_h25 <- rural_models %>%
+  filter(x == "prison_exp_h25") %>%
+  mutate(
+    # every coefficient in the model
+    coefs  = map(model, ~ tidy(.x, conf.int = TRUE) %>%
+                   select(-statistic) %>%
+                   mutate(part = "Coefficients",
+                          term = coalesce(term_lab[term], term))),
+    # the prison slope for urban and rural PUMAs (from avg_slopes)
+    groups = map(slopes, ~ .x %>%
+                   mutate(part = "Prison slope by group",
+                          term = if_else(rural == 1, "Slope in rural PUMAs",
+                                                     "Slope in urban PUMAs")) %>%
+                   select(-rural)),
+    # model information
+    fit    = map(model, ~ tibble(part = "Model",
+                                 term = c("PUMAs", "States (fixed effects)", "Within R²"),
+                                 estimate = c(nobs(.x), .x$fixef_sizes[["state_fips"]],
+                                              r2(.x, "wr2")))),
+    #ci written as text here, so the model rows just stay empty
+    rows   = pmap(list(coefs, groups, fit), ~ bind_rows(..1, ..2, ..3) %>%
+                    mutate(ci = if_else(is.na(conf.low), NA_character_,
+                                        sprintf("[%.3f, %.3f]", conf.low, conf.high))) %>%
+                    select(part, term, estimate, std.error, p.value, ci)),
+    tab    = map2(rows, y, ~ .x %>%
+                    gt(groupname_col = "part", rowname_col = "term") %>%
+                    fmt_number(columns = c(estimate, std.error), decimals = 3) %>%
+                    fmt_number(columns = p.value, decimals = 4) %>%
+                    fmt_number(columns = estimate,
+                               rows = term %in% c("PUMAs", "States (fixed effects)"),
+                               decimals = 0) %>%
+                    sub_missing(missing_text = "") %>%
+                    cols_label(estimate = "Estimate", std.error = "SE", p.value = "p",
+                               ci = "95% CI") %>%
+                    tab_header(title = outcomes[.y],
+                               subtitle = "Exposure × rural, h = 25 km, state fixed effects") %>%
+                    tab_source_note("SEs clustered by state. Exposure standardized nationally (mean 0, SD 1)."))
+  )
+
+rural_h25$tab[[1]]   # overdose
+rural_h25$tab[[2]]   # divorce
+```
+
+### test
+
+This is the same setup, but with the 25 most exposed PUMAs removed. The urban slope drops considerably, while the rural slope stays large and significant.
+
+```{r}
+
+#| label: rural-trim-check
+# Rural interaction with and without the top 1% of exposure (by measure)
+# The top 1% PUMAs are all urban, so this shows whether they drive the urban slope
+trim_grid <- expand_grid(y = names(outcomes), x = int_x)
+
+rural_trim <- bind_rows(
+  trim_grid %>%
+    mutate(sample = "All PUMAs",
+           data   = map(y, ~ model_data[[.x]])),
+  trim_grid %>%
+    mutate(sample = "Without top 1% exposure",
+           data   = map2(y, x, ~ model_data[[.x]][model_data[[.x]][[.y]] <=
+                                                    quantile(model_data[[.x]][[.y]], 0.99), ]))
+) %>%
+  mutate(
+    model  = pmap(list(y, x, data), ~ feols(as.formula(str_c(..1, " ~ ", ..2, " * rural + ",
+                                                               ctrl_str[..1], " | state_fips")),
+                                            data = ..3, cluster = ~state_fips)),
+    # urban and rural slopes
+    slopes = pmap(list(model, x, data), ~ avg_slopes(..1, variables = ..2, by = "rural",
+                                                     newdata = ..3) %>%
+                    as_tibble() %>%
+                    select(rural, estimate, p.value)),
+    # the gap (interaction) and its test
+    diff   = map2(model, x, ~ tidy(.x) %>% filter(term == str_c(.y, ":rural")) %>%
+                    select(diff = estimate, diff_p = p.value)),
+    n      = map_int(model, nobs)
+  )
+
+rural_trim %>%
+  select(y, x, sample, n, slopes, diff) %>%
+  unnest(slopes) %>%
+  unnest(diff) %>%
+  mutate(outcome = outcomes[y],
+         h       = factor(exposures[x], levels = exposures),
+         group   = if_else(rural == 1, "rural", "urban")) %>%
+  select(outcome, h, sample, n, group, estimate, p.value, diff, diff_p) %>%
+  pivot_wider(names_from = group, values_from = c(estimate, p.value)) %>%
+  select(outcome, h, sample, n, estimate_urban, p.value_urban,
+         estimate_rural, p.value_rural, diff, diff_p) %>%
+  arrange(outcome, h, sample) %>%
+  gt(groupname_col = "outcome") %>%
+  fmt_number(columns = c(estimate_urban, estimate_rural, diff), decimals = 3) %>%
+  fmt_number(columns = starts_with("p.value") | matches("diff_p"), decimals = 4) %>%
+  cols_label(estimate_urban = "Urban slope", p.value_urban = "p",
+             estimate_rural = "Rural slope", p.value_rural = "p",
+             diff = "Gap", diff_p = "p (gap)") %>%
+  tab_header(title = "Rural vs. urban prison slope, with and without the top 1% of exposure")
+```
+
+
+# NONLINEARITY (GAM)
+
+A GAM (generalized additive model) lets the data choose the shape, instead of forcing linear relationship like OLS (edf ≈ 1 => the relationship is basically a
+straight line, while larger values mean it bends)
+
+```{r}
+#| label: gam-models
+gam_models <- expand_grid(y = names(outcomes), x = infl_x) %>%
+  mutate(
+    formula = str_c(y, " ~ s(", x, ", k = 5) + ", ctrl_str[y], " + factor(state_fips)"),
+    model   = map2(formula, y, ~ gam(as.formula(.x), data = model_data[[.y]], method = "REML")),
+    smooth  = map(model, ~ summary(.x)$s.table %>% as_tibble(rownames = "term"))
+  )
+
+gam_models %>%
+  select(y, x, smooth) %>%
+  unnest(smooth) %>%
+  transmute(outcome = outcomes[y], h = exposures[x], edf, F, p_value = `p-value`) %>%
+  gt(groupname_col = "outcome") %>%
+  fmt_number(columns = c(edf, F), decimals = 2) %>%
+  fmt_number(columns = p_value, decimals = 4) %>%
+  tab_header(title = "Smooth of prison exposure (GAM with M3 controls and state FE)",
+             subtitle = "edf ≈ 1: linear; larger edf: curved")
+```
+
+The GAM confirms that the relationship between prison exposure and divorce is linear, while the relationship between prison exposure and overdose is not. The overdose relationship also seems to become increasingly nonlinear as h increases.
+
+```{r}
+#| label: fig-gam-smooths
+#| fig-height: 7
+# the estimated smooth for each model (partial effect, with 95% band and data rug)
+par(mfrow = c(2, 3))
+walk2(gam_models$model,
+      str_c(str_trunc(outcomes[gam_models$y], 25), ", ", exposures[gam_models$x]),
+      ~ plot(.x, select = 1, shade = TRUE, rug = TRUE, main = .y,
+             xlab = "Exposure (SD)", ylab = "Partial effect"))
+par(mfrow = c(1, 1))
+```
+
+# SPATIAL DIAGNOSTICS
+
+OLS assumes that PUMAs are independent of each other. But if neighboring pumas have similar residuals, this assumption doesn’t hold: the standard errors are wrong, and the model is missing something regional. Here we check this for M3 (all controls + state fixed effects) with all six exposure measures.
 
 The neighbors are defined in two ways, to see if the choice matters:
 
-Queen contiguity: PUMAs that share a border or a corner. Two PUMAs (islands) have no neighbors.
+Queen contiguity: PUMAs that share a border or a corner. Two PUMAs (islands) have no neighbors. 
 6 nearest neighbors: every PUMA gets six neighbors, no matter its size.
 
 ```{r}
@@ -1062,7 +1787,7 @@ p5_models <- all_models %>%
                            ~ lm(as.formula(.x), data = st_drop_geometry(geo_data[[.y]])))) %>%
   select(y, x, formula_lm, model)
 
-# Sanity check: the exposure coefficients match the Phase 4 feols M3 results
+# sanity check: the exposure coefficients match the Phase 4 feols M3 results
 p5_models %>%
   mutate(estimate_lm = map2_dbl(model, x, ~ coef(.x)[[.y]])) %>%
   left_join(results %>% filter(spec == "M3") %>% select(y, x, estimate_feols = estimate),
@@ -1110,7 +1835,8 @@ residual_moran %>%
   tab_header(title = "Spatial clustering before and after the model")
 ```
 
-Based on Moran’s I, overdose rates are strongly clustered, both for the outcome itself and for the residuals. This clustering might be real, but given the way the puma overdose rates were produced, it may partly be an artifact of the data. This is also supported by Moran’s I for suicide rates, which also come from the CDC and show even stronger clustering. This suggests that the way the data are constructed may produce artificial clustering.
+Based on Moran’s I, overdose rates are strongly clustered, both for the outcome itself and for the residuals. This clustering might be real, but given the way the puma overdose rates were produced, it may partly be an
+artifact of the data. This is also supported by Moran’s I for suicide rates, which also come from the CDC and show even stronger clustering. This suggests that the way the data are constructed may produce artificial clustering.
 
 ## Residual maps
 
@@ -1161,14 +1887,12 @@ resid_map_div <- geo_data$pct_divorced_past_yr %>%
 resid_map_od / resid_map_div   
 ```
 
-
 # SPATIAL MODELS
 
 | Model | Assumes | Role here |
-|-----------------|---------------------------------------|-----------------|
+|------------------|-------------------------------------|------------------|
 | SEM | nearby PUMAs share unmeasured conditions, so their errors are correlated | main spatial model |
 | SDEM | SEM + exposure in neighboring PUMAs can matter too | do prisons just outside a PUMA matter? |
-
 
 Both keep the full M3 specification (each outcome with its own controls). They're estimated by maximum likelihood, so the standard errors are model-based, not clustered.
 
@@ -1266,7 +1990,6 @@ ols_m3 <- results %>%
   select(y, x, ols_estimate = estimate, ols_se = std.error, ols_p = p.value)
 ```
 
-
 ## One exposure in detail: OLS vs. SEM vs. SDEM
 
 Set `main_x` at the top of the chunk to choose the exposure. It's also used by the model checks below.
@@ -1347,7 +2070,6 @@ main_table %>%
              subtitle = "λ = spatial error parameter (how strongly neighboring PUMAs share unexplained variation). Shaded: p < 0.05")
 ```
 
-
 ## All exposure measures: OLS vs. SEM vs. SDEM
 
 ```{r}
@@ -1386,11 +2108,9 @@ error_results %>%
              subtitle = "Continuous exposures per SD; presence = with vs. without")
 ```
 
-
 ## Model checks
 
-Three checks for the exposure chosen in `main_x`: a Hausman test (do OLS and SEM coefficients differ more than chance allows?), Moran's I on the SEM and SDEM residuals (should be close to zero), and AIC for OLS M3,
-SEM and SDEM (lower is better).
+Three checks for the exposure chosen in `main_x`: a Hausman test (do OLS and SEM coefficients differ more than chance allows?), Moran's I on the SEM and SDEM residuals (should be close to zero), and AIC for OLS M3, SEM and SDEM (lower is better).
 
 ```{r}
 #| label: p6-checks
@@ -1433,5 +2153,123 @@ error_results %>%
   select(outcome, weights, `OLS M3` = ols_aic, SEM = sem_aic, SDEM = sdem_aic)
 ```
 
+# OVERDOSE GEOGRAPHY
+
+```{r}
+#| label: cdc-split
+# tract x year overdose file (from the processing notebook)
+# group_id = CDC unit, GEOID = tract, GEOID20 = PUMA, tot_pop = 2020 population
+tract_od <- read_csv("data/final/tract_overdose_by_year_2022_2024.csv",
+                     col_types = cols(GEOID = col_character(), GEOID20 = col_character(),
+                                      group_id = col_character()))
+
+# for every CDC unit and year: how many tracts and how many PUMAs it covers
+cdc_groups <- tract_od %>%
+  group_by(group_id, year) %>%
+  summarise(n_tracts = n(),
+            n_pumas  = n_distinct(GEOID20, na.rm = TRUE),
+            .groups  = "drop") %>%
+  mutate(split = n_pumas > 1)
+
+# how many units are split (a one-tract unit can't be split, so I also show multi-tract units)
+cdc_groups %>%
+  group_by(year) %>%
+  summarise(units          = n(),
+            multi_tract    = sum(n_tracts > 1),
+            split          = sum(split),
+            share_of_multi = split / multi_tract)
+
+# for every PUMA: share of its population (and deaths) coming from split units
+puma_split <- tract_od %>%
+  filter(!is.na(GEOID20)) %>%
+  left_join(cdc_groups %>% select(group_id, year, split), by = c("group_id", "year")) %>%
+  group_by(GEOID20) %>%
+  summarise(share_split_pop    = weighted.mean(split, tot_pop, na.rm = TRUE),
+            share_split_deaths = weighted.mean(split, deaths, na.rm = TRUE)) %>%
+  mutate(split_level = cut(share_split_pop, breaks = c(-Inf, 0, 0.25, 0.5, Inf),
+                           labels = c("None", "Low", "Moderate", "High")))
+
+# how many PUMAs are in each level
+puma_split %>%
+  count(split_level) %>%
+  mutate(share = n / sum(n))
+```
+
+```{r}
+#| label: fig-cdc-split-map
+#| fig-height: 6
+puma_geo_l48 %>%
+  select(GEOID20) %>%
+  left_join(puma_split, by = "GEOID20") %>%
+  ggplot() +
+  geom_sf(aes(fill = split_level), colour = NA) +
+  scale_fill_manual(values = c(None = "grey92", Low = "#C6DBEF", Moderate = "#6BAED6",
+                               High = "#08519C"),
+                    labels = c("None", "Low (≤ 25%)", "Moderate (25–50%)", "High (> 50%)"),
+                    na.value = "white",
+                    name = "Share of PUMA population\nfrom split CDC units") +
+  labs(title = "Overdose rates built from CDC units shared with another PUMA") +
+  theme_void()
+```
+
+## Is the clustering still there where the outcome is built cleanly?
+
+All on the M3 residuals for overdose (h = 10 km):
+
+1. Local Moran's I by split level: is clustering stronger in PUMAs
+   built from shared units?
+2. Moran's I only among None/Low PUMAs vs. only among Moderate/High.
+3. M3 without the High PUMAs: do the coefficient and the clustering
+   change?
+
+```{r}
+#| label: cdc-moran
+y_od <- "overdose_rate_2022_2024"
+f_od <- as.formula(str_c(y_od, " ~ prison_exp_h10 + ", ctrl_str[y_od], " + factor(state_fips)"))
+
+# overdose sample with boundaries (projected, so snap = 1 means 1 m) and split levels
+geo_od <- puma_geo %>%
+  st_transform(5070) %>%
+  select(GEOID20) %>%
+  inner_join(model_data[[y_od]], by = "GEOID20") %>%
+  left_join(puma_split %>% select(GEOID20, share_split_pop, split_level), by = "GEOID20")
+
+m_od  <- lm(f_od, data = st_drop_geometry(geo_od))
+lw_od <- nb2listw(poly2nb(geo_od, queen = TRUE, snap = 1), style = "W", zero.policy = TRUE)
+
+# 1. local Moran's I of the residuals for every PUMA, averaged by split level
+local_moran_split <- geo_od %>%
+  st_drop_geometry() %>%
+  mutate(local_I = localmoran(residuals(m_od), lw_od, zero.policy = TRUE)[, "Ii"]) %>%
+  select(GEOID20, split_level, share_split_pop, local_I)
+
+local_moran_split %>%
+  group_by(split_level) %>%
+  summarise(n = n(), mean_local_I = mean(local_I), share_positive = mean(local_I > 0)) %>%
+  gt() %>%
+  fmt_number(columns = c(mean_local_I, share_positive), decimals = 3) %>%
+  tab_header(title = "Residual clustering by share of PUMA from split CDC units")
+
+# same question without categories: does clustering rise with the split share?
+cor.test(local_moran_split$local_I, local_moran_split$share_split_pop, method = "spearman")
+
+# 2. and 3. Moran's I in subsets, and M3 without the High PUMAs
+subsets <- list(`All PUMAs`        = geo_od,
+                `None or Low`      = geo_od %>% filter(split_level %in% c("None", "Low")),
+                `Moderate or High` = geo_od %>% filter(split_level %in% c("Moderate", "High")),
+                `Without High`     = geo_od %>% filter(split_level != "High"))
+
+imap_dfr(subsets, ~ {
+  m  <- lm(f_od, data = st_drop_geometry(.x))
+  lw <- nb2listw(poly2nb(.x, queen = TRUE, snap = 1), style = "W", zero.policy = TRUE)
+  tibble(sample        = .y,
+         n             = nobs(m),
+         prison_coef   = coef(m)[["prison_exp_h10"]],
+         resid_moran_I = lm.morantest(m, lw, zero.policy = TRUE)$estimate[[1]])
+}) %>%
+  gt() %>%
+  fmt_number(columns = c(prison_coef, resid_moran_I), decimals = 3) %>%
+  tab_header(title = "Residual Moran's I and prison coefficient by subset (M3, h = 10 km)")
+```
 
 
