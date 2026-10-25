@@ -8,4 +8,4 @@ data/raw/ddi*.rds
 data/raw/usa_*.dat.gz
 data/raw/nys_data/under_custody_nys.csv
 data/final/tract_level_dataset_2022.csv
-data/000/
+data/000//*.png
