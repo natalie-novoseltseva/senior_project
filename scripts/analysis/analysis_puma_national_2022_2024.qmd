@@ -103,6 +103,13 @@ prisons <- st_read("data/raw/prison-boundaries-1-geojson.geojson", quiet = TRUE)
   st_centroid() %>%
   st_transform(5070) %>%
   st_filter(st_union(puma_geo_l48))
+
+# get rid of ALaska ans Hawaii
+
+# contiguous US only: drop Alaska (02) and Hawaii (15)
+puma_geo <- puma_geo %>% filter(!state_fips %in% c("02", "15"))
+puma_df  <- puma_df  %>% filter(!state_fips %in% c("02", "15"))
+
 ```
 
 # DESCRIPTIVES
@@ -1011,6 +1018,8 @@ stepwise <- imap_dfr(ctrl_order, ~ tibble(
   ungroup()
 ```
 
+Overdose model
+
 ```{r}
 #| label: stepwise-h5-overdose
 
@@ -1030,6 +1039,8 @@ stepwise %>%
   sub_missing(missing_text = "") %>%
   tab_header(title = "Overdose deaths per 100,000: exposure coefficient as controls are added one at a time")
 ```
+
+Divorce model (religion1)
 
 ```{r}
 #| label: stepwise-h5-divorce
@@ -1051,6 +1062,8 @@ stepwise %>%
   tab_header(title = "% of ever-married divorced in past year: exposure coefficient as controls are added one at a time"
              )
 ```
+
+Divorce model (religion2)
 
 ```{r}
 #| label: stepwise-h5-divorce-families
@@ -1359,8 +1372,10 @@ map(model_data, ~ count(.x, rural))   # how many PUMAs in each group
 ```{r}
 #| label: rural-models
 
-#table with coefficients foe all exposure measures
-rural_models <- expand_grid(y = names(outcomes), x = int_x) %>%
+# table with coefficients for the distance-decay exposure measures
+decay_x <- str_subset(names(exposures), "^prison_exp_h")
+
+rural_models <- expand_grid(y = names(outcomes), x = decay_x) %>%
   mutate(
     formula = str_c(y, " ~ ", x, " * rural + ", ctrl_str[y], " | state_fips"),
     model   = map2(formula, y, ~ feols(as.formula(.x), data = model_data[[.y]],
@@ -1377,19 +1392,18 @@ rural_models <- expand_grid(y = names(outcomes), x = int_x) %>%
 
 rural_results <- rural_models %>%
   select(y, x, slopes, diff) %>%
-  unnest(slopes) %>%
-  unnest(diff) %>%
+  unnest(c(slopes, diff)) %>%
   mutate(outcome = factor(outcomes[y], levels = outcomes),
          h       = factor(exposures[x], levels = exposures),
-         group   = if_else(rural == 1, "Rural", "Urban"))
+         group   = factor(if_else(rural == 1, "Rural", "Urban"), levels = c("Urban", "Rural"))) %>%
+  arrange(outcome, h, group)
 
 rural_results %>%
   select(outcome, h, group, estimate, std.error, p.value, diff, diff_p) %>%
   gt(groupname_col = "outcome") %>%
   fmt_number(columns = c(estimate, std.error, diff), decimals = 3) %>%
   fmt_number(columns = c(p.value, diff_p), decimals = 4) %>%
-  tab_header(title = "Prison slope for rural and urban PUMAs (full sample, interaction)",
-             subtitle = "diff = rural − urban slope; diff_p = test that they are equal")
+  tab_header(title = "Prison slope for rural and urban PUMAs (full sample, interaction)")
 ```
 
 The table above shows the prison slope for each exposure measure and its significance in urban and rural PUMAs. For overdose, the rural slope is larger than the urban one for all of the exposures and is statistically significant for three out of four of them (at h = 25 km, p = 0.08). However, the difference between the urban and rural slopes is not statistically significant.
@@ -1641,22 +1655,16 @@ rural_h25$tab[[2]]   # divorce
 This is the same setup, but with the 25 most exposed PUMAs removed. The urban slope drops considerably, while the rural slope stays large and significant.
 
 ```{r}
-
 #| label: rural-trim-check
-# Rural interaction with and without the top 1% of exposure (by measure)
+# Rural interaction without the top 1% of exposure (by measure), decay measures only
 # The top 1% PUMAs are all urban, so this shows whether they drive the urban slope
-trim_grid <- expand_grid(y = names(outcomes), x = int_x)
+decay_x <- str_subset(names(exposures), "^prison_exp_h")
 
-rural_trim <- bind_rows(
-  trim_grid %>%
-    mutate(sample = "All PUMAs",
-           data   = map(y, ~ model_data[[.x]])),
-  trim_grid %>%
-    mutate(sample = "Without top 1% exposure",
-           data   = map2(y, x, ~ model_data[[.x]][model_data[[.x]][[.y]] <=
-                                                    quantile(model_data[[.x]][[.y]], 0.99), ]))
-) %>%
+rural_trim <- expand_grid(y = names(outcomes), x = decay_x) %>%
   mutate(
+    # drop the top 1% of exposure on that measure
+    data   = map2(y, x, ~ model_data[[.x]][model_data[[.x]][[.y]] <=
+                                             quantile(model_data[[.x]][[.y]], 0.99), ]),
     model  = pmap(list(y, x, data), ~ feols(as.formula(str_c(..1, " ~ ", ..2, " * rural + ",
                                                                ctrl_str[..1], " | state_fips")),
                                             data = ..3, cluster = ~state_fips)),
@@ -1664,33 +1672,74 @@ rural_trim <- bind_rows(
     slopes = pmap(list(model, x, data), ~ avg_slopes(..1, variables = ..2, by = "rural",
                                                      newdata = ..3) %>%
                     as_tibble() %>%
-                    select(rural, estimate, p.value)),
+                    select(rural, estimate, std.error, p.value)),
     # the gap (interaction) and its test
-    diff   = map2(model, x, ~ tidy(.x) %>% filter(term == str_c(.y, ":rural")) %>%
-                    select(diff = estimate, diff_p = p.value)),
-    n      = map_int(model, nobs)
+    diff   = map2(model, x, ~ tidy(.x) %>%
+                    filter(term == str_c(.y, ":rural")) %>%
+                    select(diff = estimate, diff_p = p.value))
   )
 
 rural_trim %>%
-  select(y, x, sample, n, slopes, diff) %>%
-  unnest(slopes) %>%
-  unnest(diff) %>%
-  mutate(outcome = outcomes[y],
+  select(y, x, slopes, diff) %>%
+  unnest(c(slopes, diff)) %>%
+  mutate(outcome = factor(outcomes[y], levels = outcomes),
          h       = factor(exposures[x], levels = exposures),
-         group   = if_else(rural == 1, "rural", "urban")) %>%
-  select(outcome, h, sample, n, group, estimate, p.value, diff, diff_p) %>%
-  pivot_wider(names_from = group, values_from = c(estimate, p.value)) %>%
-  select(outcome, h, sample, n, estimate_urban, p.value_urban,
-         estimate_rural, p.value_rural, diff, diff_p) %>%
-  arrange(outcome, h, sample) %>%
+         group   = factor(if_else(rural == 1, "Rural", "Urban"), levels = c("Urban", "Rural"))) %>%
+  arrange(outcome, h, group) %>%
+  select(outcome, h, group, estimate, std.error, p.value, diff, diff_p) %>%
   gt(groupname_col = "outcome") %>%
-  fmt_number(columns = c(estimate_urban, estimate_rural, diff), decimals = 3) %>%
-  fmt_number(columns = starts_with("p.value") | matches("diff_p"), decimals = 4) %>%
-  cols_label(estimate_urban = "Urban slope", p.value_urban = "p",
-             estimate_rural = "Rural slope", p.value_rural = "p",
-             diff = "Gap", diff_p = "p (gap)") %>%
-  tab_header(title = "Rural vs. urban prison slope, with and without the top 1% of exposure")
+  fmt_number(columns = c(estimate, std.error, diff), decimals = 3) %>%
+  fmt_number(columns = c(p.value, diff_p), decimals = 4) %>%
+  tab_header(title = "Prison slope for rural and urban PUMAs (without the top 1% of exposure)")
 ```
+
+Logged overdose rate
+
+```{r}
+#| label: rural-log-overdose
+# Rural interaction: log overdose
+decay_x <- str_subset(names(exposures), "^prison_exp_h")
+y_od    <- "overdose_rate_2022_2024"
+
+rural_log_od <- expand_grid(y = names(outcomes), x = decay_x) %>%
+  mutate(
+    # log only the overdose outcome
+    lhs    = if_else(y == y_od, str_c("log(", y, ")"), y),
+    data   = map(y, ~ model_data[[.x]][model_data[[.x]][[.x]] > 0 | .x != y_od, ]),
+    model  = pmap(list(lhs, x, data, y), ~ feols(as.formula(str_c(..1, " ~ ", ..2, " * rural + ",
+                                                                    ctrl_str[..4], " | state_fips")),
+                                                 data = ..3, cluster = ~state_fips)),
+    # urban and rural slopes
+    slopes = pmap(list(model, x, data), ~ avg_slopes(..1, variables = ..2, by = "rural",
+                                                     newdata = ..3) %>%
+                    as_tibble() %>%
+                    select(rural, estimate, std.error, p.value)),
+    # the gap (interaction) and its test
+    diff   = map2(model, x, ~ tidy(.x) %>%
+                    filter(term == str_c(.y, ":rural")) %>%
+                    select(diff = estimate, diff_p = p.value))
+  )
+
+rural_log_od %>%
+  select(y, x, slopes, diff) %>%
+  unnest(c(slopes, diff)) %>%
+  mutate(outcome    = factor(outcomes[y], levels = outcomes),
+         h          = factor(exposures[x], levels = exposures),
+         group      = factor(if_else(rural == 1, "Rural", "Urban"), levels = c("Urban", "Rural")),
+         # % change only makes sense for the logged outcome (overdose)
+         pct_change = if_else(y == y_od, 100 * (exp(estimate) - 1), NA_real_)) %>%
+  arrange(outcome, h, group) %>%
+  select(outcome, h, group, estimate, std.error, p.value, pct_change, diff, diff_p) %>%
+  gt(groupname_col = "outcome") %>%
+  fmt_number(columns = c(estimate, std.error, diff), decimals = 3) %>%
+  fmt_number(columns = c(p.value, diff_p), decimals = 4) %>%
+  fmt_number(columns = pct_change, decimals = 1) %>%
+  sub_missing(missing_text = "") %>%
+  cols_label(pct_change = "% change per 1 SD") %>%
+  tab_header(title = "Prison slope for rural and urban PUMAs (log overdose)")
+```
+
+
 
 
 # NONLINEARITY (GAM)
@@ -1731,6 +1780,7 @@ walk2(gam_models$model,
              xlab = "Exposure (SD)", ylab = "Partial effect"))
 par(mfrow = c(1, 1))
 ```
+
 
 # SPATIAL DIAGNOSTICS
 
@@ -2153,6 +2203,12 @@ error_results %>%
   select(outcome, weights, `OLS M3` = ols_aic, SEM = sem_aic, SDEM = sdem_aic)
 ```
 
+```{r}
+length(error_models$sem[[1]]$y)                 # PUMAs in the saved model
+length(p6_weights[[1]][[1]]$neighbours)         # PUMAs in the current neighbor list
+```
+
+
 # OVERDOSE GEOGRAPHY
 
 ```{r}
@@ -2214,18 +2270,10 @@ puma_geo_l48 %>%
 
 ## Is the clustering still there where the outcome is built cleanly?
 
-All on the M3 residuals for overdose (h = 10 km):
-
-1. Local Moran's I by split level: is clustering stronger in PUMAs
-   built from shared units?
-2. Moran's I only among None/Low PUMAs vs. only among Moderate/High.
-3. M3 without the High PUMAs: do the coefficient and the clustering
-   change?
-
 ```{r}
 #| label: cdc-moran
 y_od <- "overdose_rate_2022_2024"
-f_od <- as.formula(str_c(y_od, " ~ prison_exp_h10 + ", ctrl_str[y_od], " + factor(state_fips)"))
+f_od <- as.formula(str_c(y_od, " ~ prison_exp_h5 + ", ctrl_str[y_od], " + factor(state_fips)"))
 
 # overdose sample with boundaries (projected, so snap = 1 means 1 m) and split levels
 geo_od <- puma_geo %>%
@@ -2234,42 +2282,44 @@ geo_od <- puma_geo %>%
   inner_join(model_data[[y_od]], by = "GEOID20") %>%
   left_join(puma_split %>% select(GEOID20, share_split_pop, split_level), by = "GEOID20")
 
+# local Moran's I of the M3 residuals for every PUMA, using the full sample and all neighbours
 m_od  <- lm(f_od, data = st_drop_geometry(geo_od))
 lw_od <- nb2listw(poly2nb(geo_od, queen = TRUE, snap = 1), style = "W", zero.policy = TRUE)
 
-# 1. local Moran's I of the residuals for every PUMA, averaged by split level
-local_moran_split <- geo_od %>%
-  st_drop_geometry() %>%
-  mutate(local_I = localmoran(residuals(m_od), lw_od, zero.policy = TRUE)[, "Ii"]) %>%
-  select(GEOID20, split_level, share_split_pop, local_I)
+geo_od <- geo_od %>%
+  mutate(local_I = localmoran(residuals(m_od), lw_od, zero.policy = TRUE)[, "Ii"])
 
-local_moran_split %>%
-  group_by(split_level) %>%
-  summarise(n = n(), mean_local_I = mean(local_I), share_positive = mean(local_I > 0)) %>%
-  gt() %>%
-  fmt_number(columns = c(mean_local_I, share_positive), decimals = 3) %>%
-  tab_header(title = "Residual clustering by share of PUMA from split CDC units")
-
-# same question without categories: does clustering rise with the split share?
-cor.test(local_moran_split$local_I, local_moran_split$share_split_pop, method = "spearman")
-
-# 2. and 3. Moran's I in subsets, and M3 without the High PUMAs
-subsets <- list(`All PUMAs`        = geo_od,
-                `None or Low`      = geo_od %>% filter(split_level %in% c("None", "Low")),
-                `Moderate or High` = geo_od %>% filter(split_level %in% c("Moderate", "High")),
-                `Without High`     = geo_od %>% filter(split_level != "High"))
+# the subsets to compare
+# the subsets to compare: each split level, all PUMAs, and all without High
+subsets <- list(None           = geo_od %>% filter(split_level == "None"),
+                Low            = geo_od %>% filter(split_level == "Low"),
+                Moderate       = geo_od %>% filter(split_level == "Moderate"),
+                High           = geo_od %>% filter(split_level == "High"),
+                `All PUMAs`    = geo_od,
+                `Without High` = geo_od %>% filter(split_level != "High"))
 
 imap_dfr(subsets, ~ {
-  m  <- lm(f_od, data = st_drop_geometry(.x))
+  m  <- lm(f_od, data = st_drop_geometry(.x))                             # OLS M3
+  fe <- feols(as.formula(str_c(y_od, " ~ prison_exp_h5 + ", ctrl_str[y_od], " | state_fips")),
+              data = st_drop_geometry(.x), cluster = ~state_fips)          # same model, clustered SEs
   lw <- nb2listw(poly2nb(.x, queen = TRUE, snap = 1), style = "W", zero.policy = TRUE)
-  tibble(sample        = .y,
-         n             = nobs(m),
-         prison_coef   = coef(m)[["prison_exp_h10"]],
-         resid_moran_I = lm.morantest(m, lw, zero.policy = TRUE)$estimate[[1]])
+  tibble(sample         = .y,
+         n              = nobs(m),
+         prison_coef    = coef(fe)[["prison_exp_h5"]],
+         prison_p       = pvalue(fe)[["prison_exp_h5"]],
+         global_moran_y = moran.test(.x[[y_od]], lw, zero.policy = TRUE)$estimate[[1]],
+         resid_moran_I  = lm.morantest(m, lw, zero.policy = TRUE)$estimate[[1]],
+         mean_local_I   = mean(.x$local_I))
 }) %>%
   gt() %>%
-  fmt_number(columns = c(prison_coef, resid_moran_I), decimals = 3) %>%
-  tab_header(title = "Residual Moran's I and prison coefficient by subset (M3, h = 10 km)")
+  fmt_number(columns = c(prison_coef, global_moran_y, resid_moran_I, mean_local_I), decimals = 3) %>%
+  fmt_number(columns = prison_p, decimals = 4) %>%
+  cols_label(sample = "Sample", prison_coef = "Prison coefficient", prison_p = "p",
+             global_moran_y = "Moran's I (overdose)", resid_moran_I = "Moran's I (residuals)",
+             mean_local_I = "Mean local Moran's I (residuals)") %>%
+  tab_header(title = "Prison coefficient and spatial clustering by CDC split level (M3, h = 5 km)",
+             subtitle = "OLS with state fixed effects; p from SEs clustered by state") %>%
+  tab_source_note("Global Moran's I uses neighbours within each sample; local Moran's I uses all neighbours (full sample).")
 ```
 
 
